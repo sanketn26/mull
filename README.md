@@ -49,11 +49,11 @@ Video generation is out of scope. See [docs/PLAN.md](docs/PLAN.md) for details.
 
 ## Quick start
 
-Mull is not on PyPI. Install it from the repository:
+Mull is not on PyPI. Install it from the repository with [uv](https://docs.astral.sh/uv/) (`brew install uv` on macOS):
 
 ```bash
 git clone https://github.com/sanketn26/mull.git && cd mull
-make setup          # creates .venv and installs Mull plus platform extras (MLX on macOS)
+make setup          # uv sync: Python 3.12, Mull (editable), MLX on macOS, dev tools
 make test           # offline tests, about 10 s
 make run MODEL=TinyLlama/TinyLlama-1.1B-Chat-v1.0 PROMPT="What is the capital of France?"
 ```
@@ -114,7 +114,8 @@ For a model larger than RAM, the time per token is roughly the bytes read divide
 
 | Command | What it does |
 | --- | --- |
-| `make setup` | Create `.venv` and install Mull with the dev tools |
+| `make setup` | `uv sync`: create `.venv` from `uv.lock` with Mull, MLX (macOS) and dev tools |
+| `make lock` | Refresh `uv.lock` after changing dependencies in `pyproject.toml` |
 | `make test` | Run the test suite |
 | `make lint` | Run ruff |
 | `make clean` | Remove caches and build files |

@@ -24,9 +24,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mac = ["mlx"]                      # the macOS runtime
+mac = ["mlx; sys_platform == 'darwin'"]  # the macOS runtime
 cuda = ["bitsandbytes"]            # 4/8-bit compression on CUDA
 kimi = ["compressed-tensors"]      # only for checkpoints stored in that format (Kimi K3)
+
+[dependency-groups]
 dev = ["pytest", "ruff"]
 
 [project.urls]
