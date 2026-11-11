@@ -13,8 +13,7 @@ else:
     # `import airllm` always works as long as torch/transformers are installed.
     from .airllm_base import AirLLMBaseModel
     from .auto_model import AutoModel
-    from .utils import split_and_save_layers
-    from .utils import NotEnoughSpaceException
+    from .checkpoint import NotEnoughSpaceException, split_and_save_layers
 
     # Dedicated subclasses for a handful of custom-architecture models. Some of them pull in
     # optional extras (e.g. the Baichuan tokenizer needs `sentencepiece`). Import them defensively

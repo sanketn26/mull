@@ -7,7 +7,11 @@ from pathlib import Path
 
 
 def record_from_obj(obj) -> dict:
-    """Turn one JSON object (or a raw string) into ``{text, mask_prefix}``."""
+    """Turn one JSON object (or a raw string) into ``{text, mask_prefix}``.
+
+    Accepts ``text``; ``prompt``/``completion`` (or ``instruction``/``input``/``output``/
+    ``response``); or chat ``messages``. ``mask_prefix`` is the part excluded from the loss.
+    """
     if isinstance(obj, str):
         text = obj.strip()
         if not text:
@@ -15,50 +19,54 @@ def record_from_obj(obj) -> dict:
         return {"text": text, "mask_prefix": None}
     if not isinstance(obj, dict):
         raise ValueError(f"expected a JSON object or string, got {type(obj).__name__}")
-
     if obj.get("text"):
         return {"text": str(obj["text"]), "mask_prefix": None}
+    record = _record_from_prompt_completion(obj)
+    if record is None:
+        record = _record_from_messages(obj.get("messages"))
+    if record is None:
+        raise ValueError(
+            "each example needs `text`, or `prompt`/`completion`, "
+            "or `instruction`/`output`, or `messages`"
+        )
+    return record
 
+
+def _record_from_prompt_completion(obj):
     prompt = obj.get("prompt") or obj.get("instruction") or ""
     extra = obj.get("input") or ""
     completion = obj.get("completion") or obj.get("output") or obj.get("response") or ""
-    if prompt or completion:
-        prefix_parts = [p for p in (str(prompt).strip(), str(extra).strip()) if p]
-        prefix = "\n".join(prefix_parts)
-        completion = str(completion)
-        if prefix and completion:
-            sep = "" if prefix.endswith(("\n", " ")) else "\n"
-            text = f"{prefix}{sep}{completion}"
-        else:
-            text = prefix or completion
-        if not text.strip():
-            raise ValueError("prompt/completion example is empty")
-        return {"text": text, "mask_prefix": prefix or None}
+    if not (prompt or completion):
+        return None
+    prefix = "\n".join(p for p in (str(prompt).strip(), str(extra).strip()) if p)
+    completion = str(completion)
+    if prefix and completion:
+        sep = "" if prefix.endswith(("\n", " ")) else "\n"
+        text = f"{prefix}{sep}{completion}"
+    else:
+        text = prefix or completion
+    if not text.strip():
+        raise ValueError("prompt/completion example is empty")
+    return {"text": text, "mask_prefix": prefix or None}
 
-    messages = obj.get("messages")
-    if isinstance(messages, list) and messages:
-        lines = []
-        last_assistant = None
-        for msg in messages:
-            role = (msg.get("role") or "user").strip()
-            content = (msg.get("content") or "").strip()
-            if not content:
-                continue
-            lines.append(f"{role}: {content}")
-            if role == "assistant":
-                last_assistant = content
-        if not lines:
-            raise ValueError("messages example is empty")
-        text = "\n".join(lines)
-        prefix = None
-        if last_assistant and text.endswith(last_assistant):
-            prefix = text[: -len(last_assistant)]
-        return {"text": text, "mask_prefix": prefix}
 
-    raise ValueError(
-        "each example needs `text`, or `prompt`/`completion`, "
-        "or `instruction`/`output`, or `messages`"
-    )
+def _record_from_messages(messages):
+    if not (isinstance(messages, list) and messages):
+        return None
+    lines, last_assistant = [], None
+    for msg in messages:
+        role = (msg.get("role") or "user").strip()
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        lines.append(f"{role}: {content}")
+        if role == "assistant":
+            last_assistant = content
+    if not lines:
+        raise ValueError("messages example is empty")
+    text = "\n".join(lines)
+    prefix = text[: -len(last_assistant)] if last_assistant and text.endswith(last_assistant) else None
+    return {"text": text, "mask_prefix": prefix}
 
 
 def _load_json_blob(raw: str):

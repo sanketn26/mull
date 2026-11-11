@@ -1,20 +1,6 @@
-
-from transformers import GenerationConfig
-
-
 from .airllm_base import AirLLMBaseModel
 
 
-
 class AirLLMQWen2(AirLLMBaseModel):
-
-
-    def __init__(self, *args, **kwargs):
-
-
-        super(AirLLMQWen2, self).__init__(*args, **kwargs)
-
-    def get_use_better_transformer(self):
-        return False
-
-
+    """Backward-compatible name for Qwen2. ``AutoModel`` now uses ``AirLLMBaseModel`` directly,
+    since transformers drives the forward pass for every standard ``*ForCausalLM`` layout."""

@@ -1,21 +1,9 @@
-
-from transformers import GenerationConfig
-
 from .airllm_base import AirLLMBaseModel
 
 
-
 class AirLLMInternLM(AirLLMBaseModel):
+    """InternLM (``InternLMForCausalLM``, remote code). Standard Llama layout.
 
-
-    def __init__(self, *args, **kwargs):
-
-
-        super(AirLLMInternLM, self).__init__(*args, **kwargs)
-
-    def get_use_better_transformer(self):
-        return False
-    def get_generation_config(self):
-        return GenerationConfig()
-
-
+    Kept as its own class so ``AutoModel`` and existing imports resolve; it needs nothing beyond
+    the base streaming model.
+    """

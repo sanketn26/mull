@@ -15,18 +15,17 @@ class AirLLMKimiK3(AirLLMBaseModel):
     ~1GB of them.
     """
 
-    def set_layer_names_dict(self):
-        self.layer_names_dict = {
-            'embed': 'language_model.model.embed_tokens',
-            'layer_prefix': 'language_model.model.layers',
-            'norm': 'language_model.model.norm',
-            'lm_head': 'language_model.lm_head',
-            'expert_prefix': 'block_sparse_moe.experts',
-            # Not streamed: loaded once and kept resident. Together these are well under 1GB.
-            'resident': [
-                'language_model.model.output_attn_res_norm',
-                'language_model.model.output_attn_res_proj',
-                'mm_projector',
-                'vision_tower',
-            ],
-        }
+    LAYER_NAMES = {
+        'embed': 'language_model.model.embed_tokens',
+        'layer_prefix': 'language_model.model.layers',
+        'norm': 'language_model.model.norm',
+        'lm_head': 'language_model.lm_head',
+        'expert_prefix': 'block_sparse_moe.experts',
+        # Not streamed: loaded once and kept resident. Together these are well under 1GB.
+        'resident': [
+            'language_model.model.output_attn_res_norm',
+            'language_model.model.output_attn_res_proj',
+            'mm_projector',
+            'vision_tower',
+        ],
+    }

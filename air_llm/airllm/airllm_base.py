@@ -1,8 +1,6 @@
 
-from typing import List, Optional, Tuple, Union
-from tqdm import tqdm
 from pathlib import Path
-import time
+import copy
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -15,13 +13,19 @@ from transformers.quantizers import AutoHfQuantizer
 
 from .profiler import LayeredProfiler
 
-from .utils import clean_memory, load_layer, layer_tensor_names, load_layer_subset, \
-    find_or_create_local_splitted_path, load_merged_ngram_embedding, \
-    open_ngram_mmap_table, MmapEmbedding, _force_meta_embeddings, default_device
-from .persist import ModelPersister
+from .checkpoint import find_or_create_local_splitted_path, load_layer_subset
+from .memory import clean_memory, default_device
+from .prefetch import PrefetchWindow
+from .adaptive import SlidingAdaptiveMixin
+from .experts import ExpertStreamingMixin
+from .weights import WeightPlacementMixin
+from .ngram import MmapEmbedding, _force_meta_embeddings, load_merged_ngram_embedding, open_ngram_mmap_table
+from .sliding import DEFAULT_MEMORY_PERCENT, MAX_PREFETCH_WINDOW, validate_memory_percent
+from .persist.safetensor_model_persister import SafetensorModelPersister
+
 
 try:
-    import bitsandbytes as bnb
+    import bitsandbytes as bnb  # noqa: F401 - availability check
 
     bitsandbytes_installed = True
     print('>>>> bitsandbytes installed')
@@ -55,7 +59,7 @@ def restore_relocated_transformers_symbols():
             setattr(generic, name, symbol)
 
 
-class AirLLMBaseModel:
+class AirLLMBaseModel(WeightPlacementMixin, ExpertStreamingMixin, SlidingAdaptiveMixin):
     """
     Memory-frugal wrapper around a Hugging Face ``*ForCausalLM`` model.
 
@@ -68,61 +72,79 @@ class AirLLMBaseModel:
     Because transformers drives the forward pass, AirLLM no longer needs to track per-architecture
     attention/rotary/cache details: new model architectures work as soon as transformers supports
     them.
+
+    Parameters
+    ----------
+    model_local_path_or_repo_id : str or Path
+        path to the local model checkpoint or huggingface repo id
+    device : str, optional
+        runtime device. By default the best available is picked: CUDA, else Apple MPS,
+        else CPU. Pass an explicit value (e.g. "cuda:1", "cpu") to override.
+    dtype : torch.dtype, optional
+        runtime dtype; defaults to the model's own config.torch_dtype (usually bfloat16 for
+        modern models). float16 has too narrow a range for very deep models and overflows to
+        inf/NaN, which silently corrupts the output, so we don't force it.
+    max_seq_len : int, optional
+        max seq length, by default 512
+    layer_shards_saving_path : str, optional
+        optional path to save the splitted shards, by default next to the model cache
+    profiling_mode : bool, optional
+        whether to profile the model loading time, default False
+    compression: str, optional
+        '4bit' or '8bit' to enable block-wise quantization of the on-disk shards
+    hf_token: str, optional
+        huggingface api token
+    prefetching: bool, optional
+        overlap the next layer's disk load with the current layer's compute
+    delete_original: bool, optional
+        delete the original downloaded checkpoint after splitting to save disk space
+    install_hooks: bool, optional
+        attach inference streaming hooks. Training drives load/evict itself, so LoRA
+        training passes False — the hooks call ``module.to('meta')`` after forward and
+        that breaks backward.
+    load_resident: bool, optional
+        load ``resident`` modules (e.g. a vision tower) onto the GPU. Text-only LoRA
+        training leaves them on meta.
+    memory_percent: float, optional
+        percentage (0-100] of the memory that is free when the model loads which AirLLM may
+        use. Layers that fit are loaded once and kept, so they are not re-read from disk on
+        every token; the rest stream as usual. Free VRAM on CUDA, available system RAM on
+        CPU and Apple MPS. Default 25. When the budget can't fit a whole layer beyond what
+        streaming itself needs, or with 0/None, only one layer is loaded at a time.
     """
 
-    # Upper bound on how much pinned (page-locked) host memory a single prefetched layer may use.
-    # Layers larger than this are loaded into ordinary pageable memory instead.
-    max_pinned_layer_bytes = 2 * 1024 ** 3
+    # Where the streamed modules live inside the transformers model. A model family with a
+    # different layout declares its own LAYER_NAMES; no code is needed. Optional keys:
+    #   resident            modules outside the streamed sequence, loaded once (vision tower, ...)
+    #   expert_prefix       MoE experts under each layer, streamed per expert
+    #   cpu_resident        modules kept on the host and never streamed to the GPU
+    #   cpu_resident_marker name fragment of host-only tables nested inside a layer (n-gram PLE)
+    # On-disk layer format this runtime reads and writes.
+    persister_class = SafetensorModelPersister
 
-    # Subclasses override this to point at non-standard module names.
+    LAYER_NAMES = {'embed': 'model.embed_tokens',
+                   'layer_prefix': 'model.layers',
+                   'norm': 'model.norm',
+                   'lm_head': 'lm_head'}
+
     def set_layer_names_dict(self):
-        self.layer_names_dict = {'embed': 'model.embed_tokens',
-                                 'layer_prefix': 'model.layers',
-                                 'norm': 'model.norm',
-                                 'lm_head': 'lm_head'}
+        """Per-instance copy of LAYER_NAMES; subclasses may adjust it after calling super()."""
+        self.layer_names_dict = copy.deepcopy(self.LAYER_NAMES)
+
+    @property
+    def persister(self):
+        """This runtime's shard reader/writer: safetensors, on every platform."""
+        if '_persister' not in self.__dict__:
+            self._persister = self.persister_class()
+        return self._persister
 
     def __init__(self, model_local_path_or_repo_id, device=None, dtype=None, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, delete_original=False,
-                 install_hooks=True, load_resident=True):
-        """
-        Parameters
-        ----------
-        model_local_path_or_repo_id : str or Path
-            path to the local model checkpoint or huggingface repo id
-        device : str, optional
-            runtime device. By default the best available is picked: CUDA, else Apple MPS,
-            else CPU. Pass an explicit value (e.g. "cuda:1", "cpu") to override.
-        dtype : torch.dtype, optional
-            runtime dtype; defaults to the model's own config.torch_dtype (usually bfloat16 for
-            modern models). float16 has too narrow a range for very deep models and overflows to
-            inf/NaN, which silently corrupts the output, so we don't force it.
-        max_seq_len : int, optional
-            max seq length, by default 512
-        layer_shards_saving_path : str, optional
-            optional path to save the splitted shards, by default next to the model cache
-        profiling_mode : bool, optional
-            whether to profile the model loading time, default False
-        compression: str, optional
-            '4bit' or '8bit' to enable block-wise quantization of the on-disk shards
-        hf_token: str, optional
-            huggingface api token
-        prefetching: bool, optional
-            overlap the next layer's disk load with the current layer's compute
-        delete_original: bool, optional
-            delete the original downloaded checkpoint after splitting to save disk space
-        install_hooks: bool, optional
-            attach inference streaming hooks. Training drives load/evict itself, so LoRA
-            training passes False — the hooks call ``module.to('meta')`` after forward and
-            that breaks backward.
-        load_resident: bool, optional
-            load ``resident`` modules (e.g. a vision tower) onto the GPU. Text-only LoRA
-            training leaves them on meta.
-        """
-
+                 install_hooks=True, load_resident=True, memory_percent=DEFAULT_MEMORY_PERCENT):
+        """See the class docstring for the parameters."""
         self.profiling_mode = profiling_mode
         self.profiler = LayeredProfiler()
-
         self.total_disk_loading_time = None
         self.total_gpu_loading_time = None
         self.total_compression_overhead_time = None
@@ -131,95 +153,106 @@ class AirLLMBaseModel:
         if compression is not None and not bitsandbytes_installed:
             raise ImportError('WARNING: bitsandbytes not found. Compression needs bitsandbytes. '
                               'To use compression, please install bitsandbytes: `pip install bitsandbytes`')
-
         self.compression = compression
         self.hf_token = hf_token
-
+        self.memory_percent = validate_memory_percent(memory_percent)
+        self._resident_layer_indices = []
         restore_relocated_transformers_symbols()
 
         self.set_layer_names_dict()
-
         self.model_local_path, self.checkpoint_path = find_or_create_local_splitted_path(
-            model_local_path_or_repo_id,
-            layer_shards_saving_path,
-            compression=compression,
-            layer_names=self.layer_names_dict,
-            hf_token=hf_token,
-            delete_original=delete_original)
+            model_local_path_or_repo_id, layer_shards_saving_path, compression=compression,
+            layer_names=self.layer_names_dict, hf_token=hf_token, delete_original=delete_original,
+            persister=self.persister)
 
         self.running_device = device if device is not None else default_device()
         self.device = torch.device(self.running_device)
-
-        # Prefer transformers' native implementation; only trust the model's bundled remote code when
-        # transformers doesn't recognize the architecture. Vendored remote code is frequently pinned
-        # to an old transformers and breaks against the current cache/generation APIs (e.g.
-        # DeepSeek-V2's modeling_deepseek.py calls the long-removed DynamicCache.seen_tokens).
-        token_kwargs = {'token': hf_token} if hf_token is not None else {}
-        try:
-            self.config = AutoConfig.from_pretrained(
-                self.model_local_path, trust_remote_code=False, **token_kwargs)
-            self.trust_remote_code = False
-        except Exception:
-            self.config = AutoConfig.from_pretrained(
-                self.model_local_path, trust_remote_code=True, **token_kwargs)
-            self.trust_remote_code = True
-
-        # Default to the model's native dtype (bf16 for most modern models). Forcing fp16 overflows
-        # on deep models (e.g. Qwen3-235B's 94 layers) and produces garbage; bf16's wider range
-        # avoids it. Users can still override via dtype=.
-        if dtype is None:
-            cfg_dtype = getattr(self.config, "torch_dtype", None)
-            if cfg_dtype is None:
-                cfg_dtype = getattr(self.config, "dtype", None)
-            if cfg_dtype is None:
-                text_cfg = getattr(self.config, "text_config", None)
-                cfg_dtype = getattr(text_cfg, "torch_dtype", None) or getattr(text_cfg, "dtype", None)
-            if isinstance(cfg_dtype, str):
-                cfg_dtype = getattr(torch, cfg_dtype, None)
-            dtype = cfg_dtype if isinstance(cfg_dtype, torch.dtype) else torch.float16
-        self.running_dtype = dtype
+        self.config, self.trust_remote_code = self._load_config(hf_token)
+        self.running_dtype = self._resolve_dtype(dtype)
         self.dtype = self.running_dtype
-
         self.generation_config = self.get_generation_config()
         self.tokenizer = self.get_tokenizer(hf_token=hf_token)
-
-        # prefetch executor / state
-        self.prefetching = prefetching
-        if self.compression is not None and self.prefetching:
-            print("prefetching is not supported together with compression for now; disabling prefetching.")
-            self.prefetching = False
-        self._executor = ThreadPoolExecutor(max_workers=1) if self.prefetching else None
-        self._prefetch_future = None
-        self._prefetched_idx = None
+        self._init_prefetch_state(prefetching)
 
         self.init_model()
-
-        # compute layer count from the instantiated model
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["layer_prefix"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        layers_count = len(model_attr)
-
-        self.layer_names = [self.layer_names_dict['embed']] + \
-                           [f'{self.layer_names_dict["layer_prefix"]}.{i}' for i in range(layers_count)] + \
-                           [self.layer_names_dict['norm'], self.layer_names_dict['lm_head']]
-
         self.max_seq_len = max_seq_len
-
-        self.set_layers_from_layer_names()
+        self._discover_layers()
         if load_resident:
             self._load_resident_modules()
         self._load_cpu_resident_modules()
         if install_hooks:
             self._install_streaming_hooks()
 
+    def _load_config(self, hf_token):
+        """(config, trust_remote_code). Prefer transformers' native implementation.
+
+        The model's bundled remote code is only trusted when transformers doesn't recognize the
+        architecture: vendored code is often pinned to an old transformers and breaks against the
+        current cache/generation APIs (DeepSeek-V2 calls the long-removed DynamicCache.seen_tokens).
+        """
+        token_kwargs = {'token': hf_token} if hf_token is not None else {}
+        try:
+            return AutoConfig.from_pretrained(self.model_local_path, trust_remote_code=False, **token_kwargs), False
+        except Exception:
+            return AutoConfig.from_pretrained(self.model_local_path, trust_remote_code=True, **token_kwargs), True
+
+    def _resolve_dtype(self, dtype):
+        """The requested dtype, else the model's native one (bf16 for most modern models).
+
+        Forcing fp16 overflows on deep models (Qwen3-235B's 94 layers) and produces garbage;
+        bf16's wider range avoids it.
+        """
+        if dtype is not None:
+            return dtype
+        cfg_dtype = getattr(self.config, "torch_dtype", None) or getattr(self.config, "dtype", None)
+        if cfg_dtype is None:
+            text_cfg = getattr(self.config, "text_config", None)
+            cfg_dtype = getattr(text_cfg, "torch_dtype", None) or getattr(text_cfg, "dtype", None)
+        if isinstance(cfg_dtype, str):
+            cfg_dtype = getattr(torch, cfg_dtype, None)
+        return cfg_dtype if isinstance(cfg_dtype, torch.dtype) else torch.float16
+
+    def _init_prefetch_state(self, prefetching):
+        self.prefetching = prefetching
+        if self.compression is not None and self.prefetching:
+            print("prefetching is not supported together with compression for now; disabling prefetching.")
+            self.prefetching = False
+        # Sliding adaptive processing may keep up to MAX_PREFETCH_WINDOW reads in flight; the
+        # planner sets the actual window. Idle worker threads cost nothing.
+        self._executor = ThreadPoolExecutor(max_workers=MAX_PREFETCH_WINDOW) if self.prefetching else None
+        self._window = 1 if self.prefetching else 0   # without a plan: classic one-layer prefetch
+        self.prefetch_window = None                    # set once the streamed layers are known
+        self.sliding_plan = None
+        # Single-slot prefetch state, still used by the LoRA trainer's own streaming loop.
+        self._prefetch_future = None
+        self._prefetched_idx = None
+
+    def _discover_layers(self):
+        """Name and collect the streamed modules: embed, every decoder layer, norm, lm_head."""
+        names = self.layer_names_dict
+        layers_count = len(self._module_at(names["layer_prefix"]))
+        self.layer_names = ([names['embed']] + [f'{names["layer_prefix"]}.{i}' for i in range(layers_count)]
+                            + [names['norm'], names['lm_head']])
+        self.set_layers_from_layer_names()
+
+    def _module_at(self, dotted_path):
+        module = self.model
+        for attr_name in dotted_path.split("."):
+            module = getattr(module, attr_name)
+        return module
+
     # ---- customization hooks for subclasses -------------------------------------------------
 
     def get_generation_config(self):
+        """The checkpoint's generation defaults, or the special tokens from its config.
+
+        Falling back to an empty GenerationConfig would drop eos_token_id, and generate() would
+        then run past the end of every answer.
+        """
         try:
             return GenerationConfig.from_pretrained(self.model_local_path)
         except Exception:
-            return GenerationConfig()
+            return GenerationConfig.from_model_config(self.config)
 
     def get_tokenizer(self, hf_token=None):
         if hf_token is not None:
@@ -403,272 +436,11 @@ class AirLLMBaseModel:
         self.model.__class__ = _AirLLMRuntimeModel
 
     def set_layers_from_layer_names(self):
-        self.layers = []
+        names = self.layer_names_dict
+        self.layers = ([self._module_at(names["embed"])] + list(self._module_at(names["layer_prefix"]))
+                       + [self._module_at(names["norm"]), self._module_at(names["lm_head"])])
 
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["embed"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        self.layers.append(model_attr)
-
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["layer_prefix"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        self.layers.extend(list(model_attr))
-
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["norm"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        self.layers.append(model_attr)
-
-        model_attr = self.model
-        for attr_name in self.layer_names_dict["lm_head"].split("."):
-            model_attr = getattr(model_attr, attr_name)
-        self.layers.append(model_attr)
-
-    # ---- weight streaming -------------------------------------------------------------------
-
-    def load_layer_to_cpu(self, layer_name):
-        t = time.time()
-        load_layer_output = load_layer(self.checkpoint_path, layer_name, self.profiling_mode)
-        elapsed_time = time.time() - t
-
-        if self.profiling_mode:
-            state_dict, compression_time = load_layer_output
-            disk_loading_time = elapsed_time - compression_time
-            self.profiler.add_profiling_time('load_safe_tensor', disk_loading_time)
-            self.profiler.add_profiling_time('compression_time', compression_time)
-        else:
-            state_dict = load_layer_output
-
-        if self.prefetching and torch.cuda.is_available():
-            # pin_memory() returns a pinned copy rather than pinning in place, so the result has to
-            # be kept for the faster host->device copy to actually happen. Pinned memory can't be
-            # paged out, so we only spend it on layers small enough to be safe: a frontier MoE
-            # checkpoint has ~17GB layers, and with prefetching two are in flight at once, which
-            # would lock up ~34GB of RAM for a copy that is dwarfed by the disk read anyway.
-            total_bytes = sum(v.numel() * v.element_size() for v in state_dict.values())
-            if total_bytes <= self.max_pinned_layer_bytes:
-                try:
-                    for k in state_dict.keys():
-                        state_dict[k] = state_dict[k].pin_memory()
-                except RuntimeError:
-                    # Out of pinned memory: fall back to pageable, which is slower but always works.
-                    pass
-
-        return state_dict
-
-    def _restore_plain_weight_modules(self, state_dict):
-        """Undo CT's packed-parameter layout when the checkpoint still ships a plain ``weight``.
-
-        Some checkpoints (Kimi K3) list residual/router Linears under the MXFP4 target list but
-        store them as bf16. After ``preprocess_model`` those modules expose ``weight_packed`` and
-        reject the real ``weight`` tensor. Restore a meta ``weight`` Parameter so the shard can load.
-        """
-        plain = {k[:-len('.weight')] for k in state_dict if k.endswith('.weight')}
-        packed = {k[:-len('.weight_packed')] for k in state_dict if k.endswith('.weight_packed')}
-        for prefix in plain - packed:
-            try:
-                module = self.model.get_submodule(prefix)
-            except AttributeError:
-                continue
-            names = list(module._parameters.keys())
-            if 'weight' in names or 'weight_packed' not in names:
-                continue
-            weight = state_dict[f'{prefix}.weight']
-            for name in names:
-                if name == 'weight' or name.startswith('weight_'):
-                    module._parameters.pop(name, None)
-            module.register_parameter(
-                'weight',
-                torch.nn.Parameter(torch.empty(weight.shape, device='meta', dtype=weight.dtype),
-                                   requires_grad=False),
-            )
-            for attr in ('quantization_scheme', 'quantization_status', 'quantization_format'):
-                if hasattr(module, attr):
-                    delattr(module, attr)
-
-    def _decompress_state_dict(self, state_dict):
-        """Expand packed payloads into the plain weights the modules expect.
-
-        compressed-tensors has no quantized compute kernels: it registers a hook that decompresses
-        the whole model before the first forward, after which every quantized module wants a plain
-        ``weight``. Our shards still hold ``weight_packed``/``weight_scale``, so we expand them here.
-
-        The expansion happens on the GPU, after transferring the *packed* bytes. For MXFP4 that
-        moves 4x less data across PCIe than transferring an already-expanded weight would.
-        """
-        if self.hf_quantizer is None:
-            return state_dict
-
-        packed_prefixes = {k[: -len('.weight_packed')]
-                           for k in state_dict if k.endswith('.weight_packed')}
-        if not packed_prefixes:
-            return state_dict
-
-        from compressed_tensors.compressors.base import BaseCompressor
-        try:
-            from compressed_tensors.linear.compressed_linear import CompressedLinear
-        except ImportError:
-            CompressedLinear = None
-
-        out = dict(state_dict)
-        for prefix in packed_prefixes:
-            try:
-                module = self.model.get_submodule(prefix)
-            except AttributeError:
-                continue
-            # CompressedLinear's own forward consumes the packed payload, so leave it packed.
-            if CompressedLinear is not None and isinstance(module, CompressedLinear):
-                continue
-            scheme = getattr(module, 'quantization_scheme', None)
-            if scheme is None or getattr(scheme, 'format', None) is None:
-                continue
-
-            local = {k[len(prefix) + 1:]: v.to(self.running_device)
-                     for k, v in state_dict.items() if k.startswith(prefix + '.')}
-            # scheme.format is an enum on some compressed-tensors versions and a plain str on others.
-            fmt = getattr(scheme.format, 'value', scheme.format)
-            compressor = BaseCompressor.get_value_from_registry(fmt)
-            decompressed = compressor.decompress(local, scheme)
-
-            for k in local:
-                out.pop(f'{prefix}.{k}', None)
-            if 'weight' in decompressed:
-                # Once expanded, the module reads only `weight`; the scales that came back merely
-                # describe how the checkpoint stored it, and keeping them would waste VRAM.
-                out[f'{prefix}.weight'] = decompressed['weight']
-                self._expose_plain_weight(module, decompressed['weight'])
-            else:
-                for k, v in decompressed.items():
-                    out[f'{prefix}.{k}'] = v
-        return out
-
-    def _expose_plain_weight(self, module, weight):
-        """Swap a module's packed parameters for the plain ``weight`` its forward reads.
-
-        compressed-tensors patches a ``quantized_forward`` onto quantized Linears that reads
-        ``self.weight``; the packed parameters only describe how the checkpoint stores the value.
-        Marking the module COMPRESSED tells that forward the weight is already on the quantization
-        grid, so it skips a fake-quantize that would only reproduce what we just decompressed.
-        """
-        existing = module._parameters.get('weight')
-        if existing is None or existing.shape != weight.shape:
-            for name in [n for n in list(module._parameters) if n.startswith('weight')]:
-                module._parameters.pop(name, None)
-            module.register_parameter(
-                'weight',
-                torch.nn.Parameter(torch.empty(weight.shape, device='meta', dtype=weight.dtype),
-                                   requires_grad=False),
-            )
-        try:
-            from compressed_tensors.quantization import QuantizationStatus
-        except ImportError:
-            return
-        module.quantization_status = QuantizationStatus.COMPRESSED
-
-    def _adopt_checkpoint_shape(self, param_name, value):
-        """Resize a meta placeholder whose shape disagrees with the checkpoint.
-
-        A model class builds its parameters from the config, and that construction can disagree
-        with the weights actually shipped. Kimi K3 sizes ``A_log`` from ``num_heads`` while its
-        checkpoint stores one entry per head channel, which would abort the load. For a parameter
-        still on meta -- i.e. one we have never materialised -- the checkpoint is the source of
-        truth, so adopt its shape.
-        """
-        module_path, _, attr = param_name.rpartition('.')
-        try:
-            module = self.model.get_submodule(module_path) if module_path else self.model
-        except AttributeError:
-            return
-        current = module._parameters.get(attr)
-        if current is None or current.device.type != 'meta' or current.shape == value.shape:
-            return
-
-        if not hasattr(self, '_shape_adoption_warned'):
-            self._shape_adoption_warned = set()
-        if attr not in self._shape_adoption_warned:
-            self._shape_adoption_warned.add(attr)
-            print(f"{attr}: checkpoint ships {tuple(value.shape)} but the model class builds "
-                  f"{tuple(current.shape)}; using the checkpoint shape.")
-
-        module.register_parameter(
-            attr,
-            torch.nn.Parameter(torch.empty(value.shape, device='meta', dtype=current.dtype),
-                               requires_grad=False),
-        )
-
-    def move_layer_to_device(self, state_dict):
-        self._restore_plain_weight_modules(state_dict)
-        state_dict = self._decompress_state_dict(state_dict)
-        marker = self.layer_names_dict.get('cpu_resident_marker')
-        moved = []
-        for param_name in self._param_names_from_state_dict(state_dict):
-            # A nested CPU table (Flash-Next PLE) must never be placed on the GPU, even if a
-            # decoder-layer shard still contains it.
-            if param_name in getattr(self, '_cpu_resident_params', ()):
-                continue
-            if marker and marker in param_name:
-                continue
-            if self.hf_quantizer is not None and self._needs_quantization(param_name):
-                # On-the-fly-quantizing schemes (e.g. bitsandbytes) reconstruct the param from the
-                # weight plus companion quant-state tensors carried in state_dict.
-                self.hf_quantizer.create_quantized_param(self.model, state_dict[param_name], param_name,
-                                                         self.running_device, state_dict)
-            else:
-                # Normal load. Only ordinary high-precision tensors get cast to the runtime dtype;
-                # pre-quantized payloads must be placed verbatim (see _should_load_verbatim).
-                value = state_dict[param_name]
-                self._adopt_checkpoint_shape(param_name, value)
-                if self._should_load_verbatim(param_name, value):
-                    set_module_tensor_to_device(self.model, param_name, self.running_device, value=value)
-                else:
-                    set_module_tensor_to_device(self.model, param_name, self.running_device,
-                                                value=value, dtype=self.running_dtype)
-            moved.append(param_name)
-        return moved
-
-    # Suffixes of the companion tensors that pre-quantized checkpoints ship alongside a weight
-    # (fp8 block scales, compressed-tensors/MXFP4 packed payloads and their scales, GPTQ indices).
-    _QUANT_COMPANION_SUFFIXES = ("_scale", "_scale_inv", "_packed", "_zero_point", "_g_idx", "_shape")
-
-    def _should_load_verbatim(self, param_name, value):
-        """Whether a checkpoint tensor must be placed on the device without a dtype cast.
-
-        Casting a pre-quantized payload to the runtime dtype destroys it: an fp8 weight loses its
-        quantization, and a 4-bit MXFP4 ``weight_packed`` tensor (stored as packed integers) becomes
-        meaningless floats. Equally important for very large models, decompressing on load would
-        multiply a layer's footprint by ~4x, which is what keeps Kimi-K3-class checkpoints from
-        fitting on a single GPU. So we keep anything that isn't a plain high-precision float as-is.
-        """
-        if not value.is_floating_point():
-            # Packed 4-bit payloads, zero points, g_idx, shape metadata.
-            return True
-        if value.element_size() == 1:
-            # Any 8-bit float: fp8 e4m3/e5m2 weights, and the e8m0 scales MXFP4 uses.
-            return True
-        return param_name.endswith(self._QUANT_COMPANION_SUFFIXES)
-
-    def _needs_quantization(self, param_name):
-        q = self.hf_quantizer
-        # transformers renamed check_quantized_param -> param_needs_quantization.
-        if hasattr(q, "param_needs_quantization"):
-            return q.param_needs_quantization(self.model, param_name)
-        return q.check_quantized_param(self.model, param_value=None, param_name=param_name, state_dict={})
-
-    def _param_names_from_state_dict(self, state_dict):
-        names = []
-        for param_name in state_dict.keys():
-            # bitsandbytes stores a weight plus companion quant-state tensors named
-            # "<weight>.4bit.*" / "<weight>.8bit.*"; those are reconstructed together via
-            # create_quantized_param, so collapse them down to the base weight name. Everything
-            # else (including fp8 weight + weight_scale_inv pairs) is kept as distinct params.
-            if '.4bit.' in param_name or '.8bit.' in param_name:
-                base = param_name.split('.4bit.')[0].split('.8bit.')[0]
-                if base not in names:
-                    names.append(base)
-            elif param_name not in names:
-                names.append(param_name)
-        return names
+    # ---- modules outside the streamed sequence ----------------------------------------------
 
     def _load_resident_modules(self):
         """Load modules that sit outside the streamed embed -> layers -> norm -> lm_head sequence.
@@ -764,9 +536,16 @@ class AirLLMBaseModel:
         else:
             self._streamed_indices = list(range(n))
 
-        self._streamed_set = set(self._streamed_indices)
-
+        self._keep_layers_resident()
         self._setup_expert_streaming()
+
+        # Prefetched layers stay in host memory; the main thread places them on the device.
+        # Copying to Apple MPS from a worker was tried: MPS queues the copy behind the running
+        # layer anyway, so it was ~8% slower and doubled the GPU's live memory.
+        self.prefetch_window = PrefetchWindow(
+            self._streamed_indices, self._load_streamed_layer,
+            size=self._window if self.prefetching else 0,
+            size_of=self._layer_file_bytes, executor=self._executor)
 
         for idx in self._streamed_indices:
             module = self.layers[idx]
@@ -774,110 +553,7 @@ class AirLLMBaseModel:
             module.register_forward_pre_hook(self._pre_hook)
             module.register_forward_hook(self._post_hook)
 
-    # ---- per-expert streaming ---------------------------------------------------------------
-
-    def _setup_expert_streaming(self):
-        """Stream individual MoE experts instead of whole decoder layers, where that is possible.
-
-        A sparse MoE layer holds hundreds of experts but routes each token to a handful of them.
-        Materialising the whole layer is therefore enormously wasteful: for Kimi K3 a layer's
-        experts are ~55GB expanded, of which a token touches ~1GB. Because the model calls each
-        selected expert as its own module (and skips unselected ones), a forward hook per expert
-        loads exactly the experts that actually run.
-
-        This needs `expert_prefix` in layer_names_dict and safetensors shards, since it relies on
-        reading individual tensors out of a shard.
-        """
-        self._expert_streaming = False
-        self._expert_keys = {}
-        self._non_expert_keys = {}
-
-        expert_prefix = self.layer_names_dict.get('expert_prefix')
-        if not expert_prefix:
-            return
-        if type(ModelPersister.get_model_persister()).__name__ != 'SafetensorModelPersister':
-            return
-        if self.compression is not None:
-            # Per-expert loading reads tensors straight out of the shard with load_layer_subset(),
-            # which -- unlike load_layer() -- does not run uncompress_layer_state_dict(). With
-            # compression on, the shard holds a quantized payload plus companion .4bit./.8bit.
-            # quant-state tensors, so streaming subsets of it would hand still-quantized weights to
-            # move_layer_to_device(). Fall back to whole-layer streaming, which does decompress.
-            print("per-expert streaming is not supported together with compression for now; "
-                  "streaming whole layers instead.")
-            return
-
-        layer_prefix = self.layer_names_dict['layer_prefix']
-        hooked = 0
-
-        for idx in self._streamed_indices:
-            layer_name = self.layer_names[idx]
-            if not layer_name.startswith(layer_prefix + '.'):
-                continue
-            try:
-                names = layer_tensor_names(self.checkpoint_path, layer_name)
-            except Exception:
-                continue
-
-            marker = f'.{expert_prefix}.'
-            per_expert = {}
-            others = []
-            for key in names:
-                pos = key.find(marker)
-                if pos == -1:
-                    others.append(key)
-                    continue
-                rest = key[pos + len(marker):]
-                head = rest.split('.', 1)[0]
-                if not head.isdigit():
-                    others.append(key)
-                    continue
-                per_expert.setdefault(int(head), []).append(key)
-
-            if not per_expert:
-                continue
-
-            layer_module = self.layers[idx]
-            experts_container = layer_module
-            try:
-                for attr in expert_prefix.split('.'):
-                    experts_container = getattr(experts_container, attr)
-            except AttributeError:
-                continue
-
-            self._non_expert_keys[idx] = others
-            self._expert_keys[idx] = per_expert
-
-            for expert_idx, keys in per_expert.items():
-                if expert_idx >= len(experts_container):
-                    continue
-                expert_module = experts_container[expert_idx]
-                expert_module._airllm_expert = (idx, expert_idx)
-                expert_module.register_forward_pre_hook(self._expert_pre_hook)
-                expert_module.register_forward_hook(self._expert_post_hook)
-                hooked += 1
-
-        if hooked:
-            self._expert_streaming = True
-            n_layers = len(self._expert_keys)
-            print(f"per-expert streaming enabled: {hooked} experts across {n_layers} layers "
-                  f"load on demand, so only the experts a token routes to are materialised.")
-
-    def _expert_pre_hook(self, module, args):
-        layer_idx, expert_idx = module._airllm_expert
-        keys = self._expert_keys[layer_idx][expert_idx]
-        state_dict = load_layer_subset(self.checkpoint_path, self.layer_names[layer_idx], keys)
-        module._airllm_moved = self.move_layer_to_device(state_dict)
-
-    def _expert_post_hook(self, module, args, output):
-        for param_name in getattr(module, '_airllm_moved', []):
-            set_module_tensor_to_device(self.model, param_name, 'meta')
-        module._airllm_moved = []
-        return output
-
-    def _next_streamed_idx(self, idx):
-        nxt = idx + 1
-        return nxt if nxt in self._streamed_set else None
+    # ---- streaming hooks: load a layer just before it runs, release it right after --------
 
     def _load_streamed_layer(self, idx):
         """Load one streamed module's weights. Experts are excluded when they stream themselves."""
@@ -889,19 +565,8 @@ class AirLLMBaseModel:
     def _pre_hook(self, module, args):
         idx = module._airllm_idx
 
-        if self.prefetching and self._prefetch_future is not None and self._prefetched_idx == idx:
-            state_dict = self._prefetch_future.result()
-            self._prefetch_future = None
-        else:
-            state_dict = self._load_streamed_layer(idx)
-
+        state_dict = self.prefetch_window.take(idx)
         module._airllm_moved = self.move_layer_to_device(state_dict)
-
-        if self.prefetching:
-            nxt = self._next_streamed_idx(idx)
-            if nxt is not None:
-                self._prefetch_future = self._executor.submit(self._load_streamed_layer, nxt)
-                self._prefetched_idx = nxt
 
     def _post_hook(self, module, args, output):
         # module.to('meta') would also evict experts (which manage their own lifetime) and any

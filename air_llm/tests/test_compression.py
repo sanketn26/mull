@@ -4,11 +4,11 @@ import unittest
 import torch
 sys.path.insert(0, '../airllm')
 
-from airllm import compress_layer_state_dict, uncompress_layer_state_dict
+from airllm.utils import compress_layer_state_dict, uncompress_layer_state_dict, bitsandbytes_installed
 
 
-
-
+@unittest.skipUnless(torch.cuda.is_available() and bitsandbytes_installed,
+                     "compression needs CUDA and bitsandbytes")
 class TestCompression(unittest.TestCase):
     def setUp(self):
         pass

@@ -18,13 +18,12 @@ class AirLLMQwen3_5(AirLLMBaseModel):
     to a PyTorch implementation when they are missing.
     """
 
-    def set_layer_names_dict(self):
-        self.layer_names_dict = {
-            'embed': 'model.language_model.embed_tokens',
-            'layer_prefix': 'model.language_model.layers',
-            'norm': 'model.language_model.norm',
-            'lm_head': 'lm_head',
-            'resident': [
-                'model.visual',
-            ],
-        }
+    LAYER_NAMES = {
+        'embed': 'model.language_model.embed_tokens',
+        'layer_prefix': 'model.language_model.layers',
+        'norm': 'model.language_model.norm',
+        'lm_head': 'lm_head',
+        'resident': [
+            'model.visual',
+        ],
+    }

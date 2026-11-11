@@ -1,5 +1,32 @@
+import torch
+
 from .airllm_base import AirLLMBaseModel
-from .utils import _wrap_forward_int64_scatter
+
+
+def _wrap_forward_int64_scatter(orig_forward):
+    """Make ``tensor.scatter(..., index)`` accept int32 indices for one forward.
+
+    Transformers' Qwen4-Exp sparse-attention indexer fills ``selected_token_indices`` as
+    ``int32`` and scatters them into a bool mask. ``torch.Tensor.scatter`` requires ``int64``,
+    so generate crashes on the first sparse-attention layer. The wrap is scoped to that
+    forward so the rest of PyTorch is unchanged.
+    """
+    def forward(self, *args, **kwargs):
+        orig_scatter = torch.Tensor.scatter
+
+        def scatter(tensor, dim, index, *a, **kw):
+            if torch.is_tensor(index) and index.dtype != torch.int64:
+                index = index.to(torch.int64)
+            return orig_scatter(tensor, dim, index, *a, **kw)
+
+        torch.Tensor.scatter = scatter
+        try:
+            return orig_forward(self, *args, **kwargs)
+        finally:
+            torch.Tensor.scatter = orig_scatter
+
+    return forward
+
 
 
 def _ensure_qwen4_exp_indexer_scatter_int64():
@@ -45,18 +72,20 @@ class AirLLMQwen4Exp(AirLLMBaseModel):
     when they are missing.
     """
 
-    def set_layer_names_dict(self):
+    LAYER_NAMES = {
+        'embed': 'model.language_model.embed_tokens',
+        'layer_prefix': 'model.language_model.layers',
+        'norm': 'model.language_model.hyper_connection_mixer',
+        'lm_head': 'lm_head',
+        'resident': [
+            'model.visual',
+        ],
+        # Matches ``model.language_model.layers.{i}.ple.ple_embedding.ngram_embedding`` for
+        # whatever layer ``ple_layer_ids`` selected. The splitter peels those tensors out of
+        # the parent decoder layer so streaming that layer cannot drag ~102GB onto the GPU.
+        'cpu_resident_marker': 'ple.ple_embedding.ngram_embedding',
+    }
+
+    def __init__(self, *args, **kwargs):
         _ensure_qwen4_exp_indexer_scatter_int64()
-        self.layer_names_dict = {
-            'embed': 'model.language_model.embed_tokens',
-            'layer_prefix': 'model.language_model.layers',
-            'norm': 'model.language_model.hyper_connection_mixer',
-            'lm_head': 'lm_head',
-            'resident': [
-                'model.visual',
-            ],
-            # Matches ``model.language_model.layers.{i}.ple.ple_embedding.ngram_embedding`` for
-            # whatever layer ``ple_layer_ids`` selected. The splitter peels those tensors out of
-            # the parent decoder layer so streaming that layer cannot drag ~102GB onto the GPU.
-            'cpu_resident_marker': 'ple.ple_embedding.ngram_embedding',
-        }
+        super().__init__(*args, **kwargs)

@@ -29,7 +29,7 @@ from .lora_linear import (
     lora_parameters,
     lora_state_dict,
 )
-from .utils import clean_memory
+from .memory import clean_memory
 
 
 class _StreamedModule(torch.autograd.Function):
@@ -76,10 +76,19 @@ class _StreamedModule(torch.autograd.Function):
         return grad_hidden.cpu()
 
 
-class AirLLMLoRA(AirLLMQwen3_5):
-    """Streamed LoRA trainer for Qwen3.5 / Qwen3.8 dense VL (text-only)."""
+class StreamedLoRAMixin:
+    """Layer-streamed LoRA training, shared by every model family that supports it.
+
+    Mix in ahead of an AirLLM model class. That class provides the layer layout; a subclass adds
+    what differs per family: ``_make_masks``, ``_embed_and_context`` and ``_run_decoder_layer``.
+    """
+
+    # Overridden per model family.
+    DEFAULT_TARGETS = DEFAULT_LORA_TARGETS
+    SUPPORTS_PACKED_EXPERTS = False
 
     def set_layer_names_dict(self):
+        # Training is text-only: no vision tower, and embed / lm_head rows are gathered on the CPU.
         super().set_layer_names_dict()
         self.layer_names_dict["resident"] = []
         self.layer_names_dict["cpu_resident"] = [
@@ -87,45 +96,30 @@ class AirLLMLoRA(AirLLMQwen3_5):
             self.layer_names_dict["lm_head"],
         ]
 
-    def __init__(
-        self,
-        model_local_path_or_repo_id,
-        device="cuda:0",
-        dtype=None,
-        max_seq_len=512,
-        layer_shards_saving_path=None,
-        profiling_mode=False,
-        compression=None,
-        hf_token=None,
-        prefetching=True,
-        delete_original=False,
-        lora_r=16,
-        lora_alpha=32,
-        lora_dropout=0.0,
-        target_modules=None,
-        lr=1e-4,
-        ce_chunk_size=4096,
-        weight_decay=0.0,
-    ):
+    def __init__(self, model_local_path_or_repo_id, device=None, dtype=None, max_seq_len=512,
+                 layer_shards_saving_path=None, profiling_mode=False, compression=None, hf_token=None,
+                 prefetching=True, delete_original=False, lora_r=16, lora_alpha=32, lora_dropout=0.0,
+                 target_modules=None, lr=1e-4, ce_chunk_size=4096, weight_decay=0.0, packed_experts=False):
+        if packed_experts and not self.SUPPORTS_PACKED_EXPERTS:
+            raise ValueError(f"{type(self).__name__} has no packed experts to train")
         super().__init__(
-            model_local_path_or_repo_id,
-            device=device,
-            dtype=dtype,
-            max_seq_len=max_seq_len,
-            layer_shards_saving_path=layer_shards_saving_path,
-            profiling_mode=profiling_mode,
-            compression=compression,
-            hf_token=hf_token,
-            prefetching=prefetching,
+            model_local_path_or_repo_id, device=device, dtype=dtype, max_seq_len=max_seq_len,
+            layer_shards_saving_path=layer_shards_saving_path, profiling_mode=profiling_mode,
+            compression=compression, hf_token=hf_token, prefetching=prefetching,
             delete_original=delete_original,
-            install_hooks=False,
-            load_resident=False,
-        )
+            # Training drives load/evict itself: the inference hooks move modules to meta after
+            # forward, which breaks backward.
+            install_hooks=False, load_resident=False)
         self.lora_r = lora_r
         self.lora_alpha = lora_alpha
         self.ce_chunk_size = ce_chunk_size
-        self.target_modules = tuple(target_modules or DEFAULT_LORA_TARGETS)
+        self.target_modules = tuple(target_modules or self.DEFAULT_TARGETS)
+        self._disable_inference_caching()
+        self._configure_for_training()
+        self._finish_lora_setup(
+            lora_r, lora_alpha, lora_dropout, lr, weight_decay, packed_experts=packed_experts)
 
+    def _disable_inference_caching(self):
         self.model.config.use_cache = False
         text_cfg = getattr(self.config, "text_config", None)
         if text_cfg is not None:
@@ -134,8 +128,8 @@ class AirLLMLoRA(AirLLMQwen3_5):
             self.model.gradient_checkpointing_disable()
         self.model.eval()
 
-        self._finish_lora_setup(
-            lora_r, lora_alpha, lora_dropout, lr, weight_decay, packed_experts=False)
+    def _configure_for_training(self):
+        """Model-specific switches before adapters are injected. Default: none."""
 
     def _finish_lora_setup(self, lora_r, lora_alpha, lora_dropout, lr, weight_decay,
                             packed_experts=False):
@@ -225,27 +219,6 @@ class AirLLMLoRA(AirLLMQwen3_5):
             return len(self.layers) - 2
         raise ValueError(f"unknown streamed kind {kind}")
 
-    def _run_decoder_layer(self, layer_i, hidden, extras):
-        layer = self.layers[1 + layer_i]
-        mask_map = extras.get("mask_map")
-        text_cfg = getattr(self.config, "text_config", self.config)
-        layer_types = getattr(text_cfg, "layer_types", None)
-        if isinstance(mask_map, dict) and layer_types is not None:
-            attn_mask = mask_map[layer_types[layer_i]]
-        else:
-            attn_mask = mask_map
-        out = layer(
-            hidden,
-            position_embeddings=extras["position_embeddings"],
-            attention_mask=attn_mask,
-            position_ids=extras["position_ids"],
-            past_key_values=None,
-            use_cache=False,
-        )
-        if torch.is_tensor(out):
-            return out
-        return out[0]
-
     def _run_streamed(self, kind, hidden, extras, grad):
         """Run one streamed module. When ``grad`` is True the caller must evict after backward."""
         h = hidden.to(device=self.device, dtype=self.running_dtype)
@@ -275,51 +248,6 @@ class AirLLMLoRA(AirLLMQwen3_5):
             _StreamedModule.trainer = None
             _StreamedModule.kind = None
             _StreamedModule.extras = None
-
-    def _make_masks(self, hidden_shape, attention_mask, text_position_ids):
-        try:
-            from transformers.masking_utils import create_causal_mask, create_recurrent_attention_mask
-        except ImportError:
-            return None
-        dummy = torch.empty(
-            hidden_shape, device=self.device, dtype=self.running_dtype)
-        cfg = getattr(self.config, "text_config", self.config)
-        mask_kwargs = {
-            "config": cfg,
-            "inputs_embeds": dummy,
-            "attention_mask": attention_mask,
-            "past_key_values": None,
-            "position_ids": text_position_ids,
-        }
-        try:
-            return {
-                "full_attention": create_causal_mask(**mask_kwargs),
-                "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
-            }
-        except Exception as e:  # noqa: BLE001 - fall back to the layer's is_causal path
-            print(f"AirLLM LoRA: could not build Qwen3.5 masks ({e}); using None")
-            return None
-
-    def _embed_and_context(self, input_ids, attention_mask):
-        embed = self.layers[0]
-        hidden = F.embedding(input_ids.cpu(), embed.weight)
-        hidden = hidden.to(dtype=self.running_dtype)
-        hidden.requires_grad_(True)
-
-        batch, seq = input_ids.shape
-        pos = torch.arange(seq, device=self.device)
-        pos4 = pos.view(1, 1, -1).expand(4, batch, -1)
-        text_position_ids = pos4[0]
-        rope_position_ids = pos4[1:]
-        probe = torch.zeros(1, 1, hidden.shape[-1], device=self.device, dtype=self.running_dtype)
-        position_embeddings = self._text_model().rotary_emb(probe, rope_position_ids)
-        mask_map = self._make_masks(hidden.shape, attention_mask, text_position_ids)
-        extras_base = {
-            "position_embeddings": position_embeddings,
-            "position_ids": text_position_ids,
-            "mask_map": mask_map,
-        }
-        return hidden, extras_base
 
     def _vram_gb(self):
         if not torch.cuda.is_available():
@@ -378,70 +306,92 @@ class AirLLMLoRA(AirLLMQwen3_5):
         load_lora_state_dict(self.model, state)
 
 
-class AirLLMLoRAQwen4Exp(AirLLMQwen4Exp):
+class AirLLMLoRA(StreamedLoRAMixin, AirLLMQwen3_5):
+    """Streamed LoRA trainer for Qwen3.5 / Qwen3.8 dense VL (text-only)."""
+
+    def _run_decoder_layer(self, layer_i, hidden, extras):
+        layer = self.layers[1 + layer_i]
+        mask_map = extras.get("mask_map")
+        text_cfg = getattr(self.config, "text_config", self.config)
+        layer_types = getattr(text_cfg, "layer_types", None)
+        if isinstance(mask_map, dict) and layer_types is not None:
+            attn_mask = mask_map[layer_types[layer_i]]
+        else:
+            attn_mask = mask_map
+        out = layer(
+            hidden,
+            position_embeddings=extras["position_embeddings"],
+            attention_mask=attn_mask,
+            position_ids=extras["position_ids"],
+            past_key_values=None,
+            use_cache=False,
+        )
+        if torch.is_tensor(out):
+            return out
+        return out[0]
+
+    def _make_masks(self, hidden_shape, attention_mask, text_position_ids):
+        try:
+            from transformers.masking_utils import create_causal_mask, create_recurrent_attention_mask
+        except ImportError:
+            return None
+        dummy = torch.empty(
+            hidden_shape, device=self.device, dtype=self.running_dtype)
+        cfg = getattr(self.config, "text_config", self.config)
+        mask_kwargs = {
+            "config": cfg,
+            "inputs_embeds": dummy,
+            "attention_mask": attention_mask,
+            "past_key_values": None,
+            "position_ids": text_position_ids,
+        }
+        try:
+            return {
+                "full_attention": create_causal_mask(**mask_kwargs),
+                "linear_attention": create_recurrent_attention_mask(**mask_kwargs),
+            }
+        except Exception as e:  # noqa: BLE001 - fall back to the layer's is_causal path
+            print(f"AirLLM LoRA: could not build Qwen3.5 masks ({e}); using None")
+            return None
+
+    def _embed_and_context(self, input_ids, attention_mask):
+        embed = self.layers[0]
+        hidden = F.embedding(input_ids.cpu(), embed.weight)
+        hidden = hidden.to(dtype=self.running_dtype)
+        hidden.requires_grad_(True)
+
+        batch, seq = input_ids.shape
+        pos = torch.arange(seq, device=self.device)
+        pos4 = pos.view(1, 1, -1).expand(4, batch, -1)
+        text_position_ids = pos4[0]
+        rope_position_ids = pos4[1:]
+        probe = torch.zeros(1, 1, hidden.shape[-1], device=self.device, dtype=self.running_dtype)
+        position_embeddings = self._text_model().rotary_emb(probe, rope_position_ids)
+        mask_map = self._make_masks(hidden.shape, attention_mask, text_position_ids)
+        extras_base = {
+            "position_embeddings": position_embeddings,
+            "position_ids": text_position_ids,
+            "mask_map": mask_map,
+        }
+        return hidden, extras_base
+
+
+class AirLLMLoRAQwen4Exp(StreamedLoRAMixin, AirLLMQwen4Exp):
     """Streamed LoRA for Qwen3.8-Flash-Next (125B MoE + 51B PLE).
 
-    A packed MoE layer is ~5GB of bf16, so this is not a 4GB recipe — peak is
-    one MoE layer plus LoRA/Adam. The n-gram table stays file-mapped on the host.
-    Vision stays on meta (text-only).
+A packed MoE layer is ~5GB of bf16, so this is not a 4GB recipe — peak is
+one MoE layer plus LoRA/Adam. The n-gram table stays file-mapped on the host.
+Vision stays on meta (text-only).
+
+    Packed-expert LoRA is off by default: 48 layers x 512 experts x r=16 is ~5.5GB of adapters and
+    ~22GB of fp32 Adam. Shared-expert / attention / hyper / PLE Linears still train. Pass
+    ``packed_experts=True`` only if you have the VRAM.
     """
 
-    def set_layer_names_dict(self):
-        super().set_layer_names_dict()
-        self.layer_names_dict["resident"] = []
-        self.layer_names_dict["cpu_resident"] = [
-            self.layer_names_dict["embed"],
-            self.layer_names_dict["lm_head"],
-        ]
+    DEFAULT_TARGETS = FLASH_NEXT_LORA_TARGETS
+    SUPPORTS_PACKED_EXPERTS = True
 
-    def __init__(
-        self,
-        model_local_path_or_repo_id,
-        device="cuda:0",
-        dtype=None,
-        max_seq_len=512,
-        layer_shards_saving_path=None,
-        profiling_mode=False,
-        compression=None,
-        hf_token=None,
-        prefetching=True,
-        delete_original=False,
-        lora_r=16,
-        lora_alpha=32,
-        lora_dropout=0.0,
-        target_modules=None,
-        lr=1e-4,
-        ce_chunk_size=4096,
-        weight_decay=0.0,
-        packed_experts=False,
-    ):
-        super().__init__(
-            model_local_path_or_repo_id,
-            device=device,
-            dtype=dtype,
-            max_seq_len=max_seq_len,
-            layer_shards_saving_path=layer_shards_saving_path,
-            profiling_mode=profiling_mode,
-            compression=compression,
-            hf_token=hf_token,
-            prefetching=prefetching,
-            delete_original=delete_original,
-            install_hooks=False,
-            load_resident=False,
-        )
-        self.lora_r = lora_r
-        self.lora_alpha = lora_alpha
-        self.ce_chunk_size = ce_chunk_size
-        self.target_modules = tuple(target_modules or FLASH_NEXT_LORA_TARGETS)
-
-        self.model.config.use_cache = False
-        text_cfg = getattr(self.config, "text_config", None)
-        if text_cfg is not None:
-            text_cfg.use_cache = False
-        if hasattr(self.model, "gradient_checkpointing_disable"):
-            self.model.gradient_checkpointing_disable()
-        self.model.eval()
-
+    def _configure_for_training(self):
         # transformers defaults MoE to grouped_mm. On a 4090 that is the Python
         # fallback, whose autograd always allocates a full-size dW for the packed
         # expert tensors (~3.4GB) even though those weights are frozen. Eager
@@ -449,28 +399,6 @@ class AirLLMLoRAQwen4Exp(AirLLMQwen4Exp):
         if hasattr(self.model, "set_experts_implementation"):
             self.model.set_experts_implementation("eager")
             print("AirLLM LoRA Flash-Next: experts_implementation=eager (skip packed-expert dW)")
-
-        # Packed-expert LoRA is off by default: 48 layers × 512 experts × r=16 is ~5.5GB of
-        # adapters and ~22GB of fp32 Adam. Shared-expert / attention / hyper / PLE Linears
-        # still train. Pass packed_experts=True only if you have the VRAM.
-        self._finish_lora_setup(
-            lora_r, lora_alpha, lora_dropout, lr, weight_decay, packed_experts=packed_experts)
-
-    _finish_lora_setup = AirLLMLoRA._finish_lora_setup
-    _module = AirLLMLoRA._module
-    _decoder_container = AirLLMLoRA._decoder_container
-    _text_model = AirLLMLoRA._text_model
-    _n_decoder_layers = AirLLMLoRA._n_decoder_layers
-    _materialize = AirLLMLoRA._materialize
-    _evict = AirLLMLoRA._evict
-    _prefetch_stream = AirLLMLoRA._prefetch_stream
-    _stream_idx_for_kind = AirLLMLoRA._stream_idx_for_kind
-    _run_streamed = AirLLMLoRA._run_streamed
-    _apply_streamed = AirLLMLoRA._apply_streamed
-    _vram_gb = AirLLMLoRA._vram_gb
-    train_step = AirLLMLoRA.train_step
-    save_adapter = AirLLMLoRA.save_adapter
-    load_adapter = AirLLMLoRA.load_adapter
 
     def _hc_count(self):
         cfg = getattr(self.config, "text_config", self.config)

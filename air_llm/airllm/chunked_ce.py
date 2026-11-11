@@ -16,6 +16,32 @@ def _compute_device(hidden):
     return torch.device("cuda")
 
 
+def _logsumexp_and_target(h, weight, labels, valid, chunk_size):
+    """Per-row log-sum-exp over the vocabulary and the target logit, one vocab chunk at a time."""
+    n, vocab = h.shape[0], weight.shape[0]
+    logz = torch.full((n,), float("-inf"), device=h.device, dtype=torch.float32)
+    target_logit = torch.zeros(n, device=h.device, dtype=torch.float32)
+    with torch.no_grad():
+        for start in range(0, vocab, chunk_size):
+            end = min(start + chunk_size, vocab)
+            w = weight[start:end].to(device=h.device, dtype=h.dtype)
+            logits = (h @ w.t()).float()
+            logz = torch.logaddexp(logz, logits.logsumexp(dim=-1))
+            in_chunk = valid & (labels >= start) & (labels < end)
+            if in_chunk.any():
+                rows = in_chunk.nonzero(as_tuple=False).squeeze(-1)
+                target_logit[rows] = logits[rows, labels[rows] - start]
+    return logz, target_logit
+
+
+def _reduce(per_token, n_valid, reduction):
+    if reduction == "sum":
+        return per_token.sum()
+    if reduction == "none":
+        return per_token
+    return per_token.sum() / n_valid
+
+
 class _ChunkedCE(torch.autograd.Function):
     """Tensor-only front door. ``weight`` is stashed on the class for one apply()."""
 
@@ -27,46 +53,27 @@ class _ChunkedCE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, labels):
         weight = _ChunkedCE.weight
+        if weight is None:
+            raise RuntimeError("chunked CE weight was not set")
         chunk_size = int(_ChunkedCE.chunk_size)
         ignore_index = int(_ChunkedCE.ignore_index)
         reduction = _ChunkedCE.reduction
-        if weight is None:
-            raise RuntimeError("chunked CE weight was not set")
 
         compute_device = _compute_device(hidden)
         h = hidden.to(compute_device)
-        n, _hidden = h.shape
+        n = h.shape[0]
         vocab = weight.shape[0]
         if chunk_size < 1:
             chunk_size = vocab
-
         labels = labels.reshape(-1).to(device=compute_device)
         if labels.numel() != n:
             raise ValueError(f"labels has {labels.numel()} elements, hidden has {n} rows")
 
         valid = labels != ignore_index
-        logz = torch.full((n,), float("-inf"), device=compute_device, dtype=torch.float32)
-        target_logit = torch.zeros(n, device=compute_device, dtype=torch.float32)
-
-        with torch.no_grad():
-            for start in range(0, vocab, chunk_size):
-                end = min(start + chunk_size, vocab)
-                w = weight[start:end].to(device=compute_device, dtype=h.dtype)
-                logits = (h @ w.t()).float()
-                logz = torch.logaddexp(logz, logits.logsumexp(dim=-1))
-                in_chunk = valid & (labels >= start) & (labels < end)
-                if in_chunk.any():
-                    rows = in_chunk.nonzero(as_tuple=False).squeeze(-1)
-                    target_logit[rows] = logits[rows, labels[rows] - start]
-
+        logz, target_logit = _logsumexp_and_target(h, weight, labels, valid, chunk_size)
         n_valid = valid.sum().clamp(min=1).to(dtype=torch.float32)
         per_token = torch.where(valid, logz - target_logit, torch.zeros_like(logz))
-        if reduction == "sum":
-            loss = per_token.sum()
-        elif reduction == "none":
-            loss = per_token
-        else:
-            loss = per_token.sum() / n_valid
+        loss = _reduce(per_token, n_valid, reduction)
 
         ctx.save_for_backward(hidden, labels.to(hidden.device))
         ctx.weight = weight

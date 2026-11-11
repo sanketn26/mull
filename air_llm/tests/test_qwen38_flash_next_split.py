@@ -30,16 +30,14 @@ from airllm.persist.safetensor_model_persister import SafetensorModelPersister
 
 _persister_mod.model_persister = SafetensorModelPersister()
 
-from airllm.utils import (
-    split_and_save_layers,
-    merge_ngram_embedding_shards,
-    load_merged_ngram_embedding,
-    open_ngram_mmap_table,
-    cpu_resident_module_names,
-    layer_owner,
+from airllm.checkpoint import cpu_resident_module_names, layer_owner, split_and_save_layers
+from airllm.ngram import (
     _force_meta_embeddings,
-    _wrap_forward_int64_scatter,
+    load_merged_ngram_embedding,
+    merge_ngram_embedding_shards,
+    open_ngram_mmap_table,
 )
+from airllm.airllm_qwen4_exp import _wrap_forward_int64_scatter
 
 N_LAYERS = 4
 LAYER_PREFIX = "model.language_model.layers"

@@ -3,7 +3,8 @@
 import os
 from pathlib import Path
 from .model_persister import ModelPersister
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
+from .fast_safetensors import read_safetensors
 
 
 
@@ -39,5 +40,5 @@ class SafetensorModelPersister(ModelPersister):
 
 
     def load_model(self, layer_name, path):
-        layer_state_dict = load_file(Path(path) / (layer_name + ".safetensors"), device="cpu")
+        layer_state_dict = read_safetensors(Path(path) / (layer_name + ".safetensors"))
         return layer_state_dict

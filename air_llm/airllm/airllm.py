@@ -1,10 +1,6 @@
-
-
 from .airllm_base import AirLLMBaseModel
 
 
-
 class AirLLMLlama2(AirLLMBaseModel):
-    def __init__(self, *args, **kwargs):
-        super(AirLLMLlama2, self).__init__(*args, **kwargs)
-
+    """Backward-compatible name for Llama models. ``AutoModel`` now uses ``AirLLMBaseModel`` directly,
+    since transformers drives the forward pass for every standard ``*ForCausalLM`` layout."""

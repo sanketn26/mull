@@ -7,9 +7,17 @@ from .model_persister import ModelPersister
 from mlx.utils import tree_unflatten
 import torch
 
-import psutil
-import numpy as np
-from itertools import starmap
+
+# compression= values the MLX backend quantizes natively, and the quantization group size. Groups
+# of 64 are MLX's default and what mlx-lm ships: one fp16 scale and bias per 64 weights, so 4-bit
+# costs ~4.5 bits per weight and 8-bit ~8.5.
+QUANT_BITS = {'4bit': 4, '8bit': 8}
+QUANT_GROUP_SIZE = 64
+
+
+def quantizable(name, shape):
+    """Matrix weights whose rows split into whole groups. Norms and odd shapes stay fp16."""
+    return name.endswith('.weight') and len(shape) == 2 and shape[-1] % QUANT_GROUP_SIZE == 0
 
 
 
@@ -55,59 +63,60 @@ def map_torch_to_mlx(model):
     return model
 
 class MlxModelPersister(ModelPersister):
+    """Layer shards for the MLX backend.
 
+    New splits are written as ``<layer>.mlx.safetensors``: fp16, or with ``compression='4bit'``
+    / ``'8bit'`` every matrix weight stored MLX-quantized (packed ``weight`` plus ``scales`` and
+    ``biases``, the names ``nn.QuantizedLinear`` uses), so the shard can be read straight into
+    quantized layers that multiply without expanding the weights. ``mx.load`` reads safetensors
+    directly into MLX arrays; the older ``.mlx.npz`` format goes through Python's zipfile,
+    including a CRC check over every byte, and loaded ~3x slower in profiling (13ms vs 4ms for a
+    100MB layer, warm). Splits made before the change are still found and loaded as ``.npz``.
+    """
+
+    FORMATS = ('mlx.safetensors', 'mlx.npz')
+    # Tells the splitter to hand compression= to persist_model instead of using bitsandbytes.
+    supports_native_compression = True
 
     def __init__(self, *args, **kwargs):
-
-
         super(MlxModelPersister, self).__init__(*args, **kwargs)
 
+    def layer_file(self, layer_name, saving_path):
+        """The shard file for ``layer_name`` (``layer_name`` without its trailing dot), or None."""
+        for fmt in self.FORMATS:
+            path = Path(saving_path) / f'{layer_name}.{fmt}'
+            if path.exists():
+                return path
+        return None
 
     def model_persist_exist(self, layer_name, saving_path):
+        # The splitter passes layer names with a trailing '.', hence no separator here.
+        done = os.path.exists(str(Path(saving_path) / (layer_name + 'mlx.done')))
+        return done and any(os.path.exists(str(Path(saving_path) / (layer_name + fmt)))
+                            for fmt in self.FORMATS)
 
-
-
-        safetensor_exists = os.path.exists(str(saving_path / (layer_name + 'mlx.npz')))
-        done_marker_exists = os.path.exists(str(saving_path / (layer_name + 'mlx.done')))
-
-        #print(f"checking {layer_name}, {saving_path} - {safetensor_exists},{done_marker_exists}")
-
-        return safetensor_exists and done_marker_exists
-
-    def persist_model(self, state_dict, layer_name, saving_path):
-        #save_file(state_dict, saving_path / (layer_name + 'safetensors'))
-        weights = {k: v.to(torch.float16).numpy() for k, v in state_dict.items()}
-        np.savez(
-            saving_path / (layer_name + 'mlx'),
-            **weights#map_torch_to_mlx(state_dict)
-        )
-
-        print(f"saved as: {saving_path / (layer_name + 'mlx')}")
-
-        # set done marker
-        (saving_path / (layer_name + 'mlx.done')).touch()
-
+    def persist_model(self, state_dict, layer_name, saving_path, compression=None):
+        if compression is not None and compression not in QUANT_BITS:
+            raise ValueError(f"MLX compression must be one of {sorted(QUANT_BITS)}, got {compression!r}")
+        bits = QUANT_BITS.get(compression)
+        arrays = {}
+        for name, value in state_dict.items():
+            array = mx.array(value.to(torch.float16).contiguous().numpy())
+            if bits and quantizable(name, array.shape):
+                packed, scales, biases = mx.quantize(array, group_size=QUANT_GROUP_SIZE, bits=bits)
+                base = name[:-len('weight')]
+                arrays[name], arrays[base + 'scales'], arrays[base + 'biases'] = packed, scales, biases
+            else:
+                arrays[name] = array
+        target = Path(saving_path) / (layer_name + 'mlx.safetensors')
+        mx.save_safetensors(str(target), arrays, metadata={'airllm_compression': compression or 'none'})
+        print(f"saved as: {target}")
+        (Path(saving_path) / (layer_name + 'mlx.done')).touch()
 
     def load_model(self, layer_name, path):
-        try:
-            to_load_path = Path(path) / (layer_name + ".mlx.npz")
-            #available = psutil.virtual_memory().available / 1024 / 1024
-            #print(f"start loading: {to_load_path}, before loading: {available:.02f}")
-            layer_state_dict = mx.load(str(to_load_path))
-            #available = psutil.virtual_memory().available / 1024 / 1024
-            #print(f"loaded {layer_name}, available mem: {available:.02f}")
-
-            layer_state_dict = map_torch_to_mlx(layer_state_dict)
-
-            weights = tree_unflatten(list(layer_state_dict.items()))
-
-            #for el in layer_name.split("."):
-            #    if len(el) > 0:
-            #        if el.isdigit():
-            #            el = int(el)
-            #        weights = weights[el]
-
-            return weights
-        except Exception as ex:
-            print(f"error: {layer_name}, {path}")
-            raise ex
+        to_load_path = self.layer_file(layer_name, path)
+        if to_load_path is None:
+            raise FileNotFoundError(f"no MLX shard for {layer_name} under {path}")
+        layer_state_dict = mx.load(str(to_load_path))
+        layer_state_dict = map_torch_to_mlx(layer_state_dict)
+        return tree_unflatten(list(layer_state_dict.items()))
