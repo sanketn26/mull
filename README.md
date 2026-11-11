@@ -18,13 +18,12 @@ Mull does not sync with upstream.
 - the training API;
 - the FAQ.
 
-Those results were measured by AirLLM, and Mull has not re-verified them. Mull is developed on a Mac without an NVIDIA GPU.
+AirLLM's own performance figures are in its documentation. Every number in this README was measured on Mull, on a 24 GB Apple-silicon Mac without an NVIDIA GPU.
 
 The package is imported as `mull`; classes keep their AirLLM names (for example `AirLLMLlamaMlx`).
 
 ## What Mull adds
 
-All numbers below were measured on a 24 GB Apple-silicon Mac.
 
 | Change | Result |
 | --- | --- |
@@ -81,7 +80,7 @@ From Python:
 ```python
 from mull import AutoModel
 
-model = AutoModel.from_pretrained("meta-llama/Llama-3.3-70B-Instruct",
+model = AutoModel.from_pretrained("NousResearch/Meta-Llama-3.1-8B-Instruct",
                                   compression="4bit", memory_percent=25)
 ```
 
