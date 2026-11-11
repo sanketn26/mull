@@ -37,7 +37,7 @@ What is next: Qwen and coding models on the Mac, a background job server with a 
 Mull is not published to PyPI. Clone the repo and install it locally:
 
 ```bash
-git clone https://github.com/sanketn26/airllm.git mull && cd mull
+git clone https://github.com/sanketn26/mull.git && cd mull
 make setup      # creates .venv and installs the package (import name: airllm)
 ```
 

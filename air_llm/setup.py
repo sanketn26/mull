@@ -22,7 +22,7 @@ setuptools.setup(
                 "for background work on Apple silicon. A fork of AirLLM.",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/sanketn26/airllm",
+    url="https://github.com/sanketn26/mull",
     packages=setuptools.find_packages(),
     # Keep the dependency surface small and pinned to a tested range so a plain
     # `make setup` gives users a known-good stack with no manual upgrades.
