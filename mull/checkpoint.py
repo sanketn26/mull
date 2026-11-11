@@ -331,9 +331,13 @@ class _CheckpointSplitter:
 
     def _link_module(self, layer):
         src = self._ensure_downloaded(self.checkpoint_path / self.passthrough[layer])
+        dst = self.saving_path / (layer + 'safetensors')
         if not self.persister.model_persist_exist(layer, self.saving_path):
-            link_or_copy_file(src, self.saving_path / (layer + 'safetensors'))
+            link_or_copy_file(src, dst)
             (self.saving_path / (layer + 'safetensors.done')).touch()
+        # A hard link or copy keeps the data once the original is gone; a symlink would not.
+        if self.delete_original and not dst.is_symlink():
+            self._delete_original(self.passthrough[layer])
         # Keep the shard cursor in step with what we skipped, so a later module that does need
         # loading doesn't walk back through (and read) every shard we just linked past.
         number = _shard_number(self.passthrough[layer])
@@ -341,6 +345,52 @@ class _CheckpointSplitter:
             self.shard = max(self.shard, number)
 
     def _read_shards_for(self, layer):
+        """Bring ``layer``'s tensors into self.state_dict.
+
+        Safetensors checkpoints are read tensor by tensor, so memory holds one module rather than
+        a whole multi-GB shard. Pickled (.bin) checkpoints can only be loaded whole.
+        """
+        if self.safetensors_format:
+            self._read_module_tensors(layer)
+        else:
+            self._read_whole_shards_for(layer)
+
+    def _module_files(self, layer):
+        """{checkpoint file: [keys]} for the tensors ``layer`` owns (host-only tables excluded)."""
+        files = defaultdict(list)
+        for k, v in self.index.items():
+            if layer_owner(k, self.layers) == layer and not (self.marker and self.marker in k):
+                files[v].append(k)
+        return files
+
+    def _read_module_tensors(self, layer):
+        files = self._module_files(layer)
+        for filename, keys in files.items():
+            if _shard_number(filename) is None:
+                self.single_modelfile = filename
+            path = self._ensure_downloaded(self.checkpoint_path / filename)
+            with safe_open(path, framework='pt', device='cpu') as f:
+                for k in keys:
+                    self.state_dict[k] = f.get_tensor(k)
+        if self.delete_original:
+            self._delete_shards_done_after(layer, files)
+
+    def _delete_shards_done_after(self, layer, files):
+        """Delete each shard once the last module that reads from it has been read."""
+        if not hasattr(self, '_last_reader'):
+            # Any module may read a shard, host-only tables included (persist_ngram_mmap reads
+            # them itself), so a shard they share is never deleted before they run.
+            position = {m: i for i, m in enumerate(self.layers)}
+            self._last_reader = {}
+            for k, f in self.index.items():
+                owner = layer_owner(k, self.layers)
+                if owner in position and position[owner] >= position.get(self._last_reader.get(f), -1):
+                    self._last_reader[f] = owner
+        for filename in files:
+            if self._last_reader.get(filename) == layer and _shard_number(filename) is not None:
+                self._delete_original(filename)
+
+    def _read_whole_shards_for(self, layer):
         """Bring every checkpoint shard holding part of ``layer`` into self.state_dict."""
         shards = [n for k, v in self.index.items() if k.startswith(layer) and (n := _shard_number(v)) is not None]
         if not shards:
@@ -380,7 +430,7 @@ class _CheckpointSplitter:
         for k in layer_state_dict:
             self.state_dict.pop(k, None)
         del layer_state_dict
-        # Splitting holds whole checkpoint shards in RAM, so free memory fully every module.
+        # Splitting may hold a whole .bin shard in RAM, so free memory fully every module.
         clean_memory(full=True)
 
     def _ensure_downloaded(self, path):

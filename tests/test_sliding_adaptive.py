@@ -87,6 +87,38 @@ class TestPlanSliding(unittest.TestCase):
         self.assertLessEqual(plan.window, 2)
 
 
+class TestLargeEmbeddingAndHead(unittest.TestCase):
+    """Llama-3.1-8B shape: embedding and LM head ~1.05GB each, 32 decoder layers ~0.44GB each."""
+    SIZES = {0: int(1.05 * GB), **{i: int(0.44 * GB) for i in range(1, 33)}, 33: 1 << 20, 34: int(1.05 * GB)}
+    BIG = (0, 34)
+
+    def plan(self, budget_gb):
+        return plan_sliding(self.SIZES, int(budget_gb * GB), free_ram_bytes=int(10 * GB))
+
+    def test_keeps_the_big_modules_resident_so_the_reserve_shrinks(self):
+        plan = self.plan(5)
+        self.assertTrue(set(self.BIG) <= set(plan.resident))
+        self.assertGreaterEqual(plan.window, 1)
+        self.assertGreater(plan.est_speedup, 1.2)
+
+    def test_plan_never_exceeds_the_budget(self):
+        floor = self.plan(1.5)   # below one layer: the documented floor, one layer at a time
+        self.assertEqual((floor.strategy, floor.resident, floor.window), ('single-layer', [], 0))
+        for budget_gb in (2.5, 3.5, 5, 8):
+            plan = self.plan(budget_gb)
+            self.assertLessEqual(plan.resident_bytes + plan.reserve_bytes, int(budget_gb * GB), budget_gb)
+
+    def test_reserve_covers_the_largest_streamed_module(self):
+        for budget_gb in (2.5, 3.5, 5, 8):
+            plan = self.plan(budget_gb)
+            streamed = [s for i, s in self.SIZES.items() if i not in plan.resident]
+            self.assertGreaterEqual(plan.reserve_bytes, (2 + plan.window) * max(streamed), budget_gb)
+
+    def test_resident_bytes_beat_resident_count(self):
+        plan = self.plan(3.6)
+        self.assertGreater(plan.resident_bytes, 2 * GB)
+
+
 class TestValidateMemoryPercent(unittest.TestCase):
     def test_default_is_25(self):
         self.assertEqual(DEFAULT_MEMORY_PERCENT, 25)

@@ -117,31 +117,55 @@ class _Budget:
         self.budget, self.kv_cache = budget_bytes, kv_cache_bytes
         self.unified, self.host_budget, self.free_ram = unified_memory, host_budget_bytes, free_ram_bytes
 
-    def device_reserve(self, window):
+    def device_reserve(self, window, largest=None):
         """Budget kept for streaming: the running layer, plus its staging copy and the window
-        when they share this memory."""
+        when they share this memory. ``largest``: the biggest module still streamed."""
+        largest = self.largest if largest is None else largest
         layers = 2 + window if self.unified else 1
-        return int((layers * self.largest + self.kv_cache) * _WORKING_MEMORY_SLACK)
+        return int((layers * largest + self.kv_cache) * _WORKING_MEMORY_SLACK)
 
-    def window_fits(self, window):
-        if self.device_reserve(window) > self.budget:
-            return False
-        if not self.unified and self.host_budget is not None:
-            return (window + 1) * self.largest * _WORKING_MEMORY_SLACK <= self.host_budget
-        return True
+    def host_fits(self, window, largest):
+        """On a discrete GPU the window waits in host RAM, bounded by host_budget."""
+        if self.unified or self.host_budget is None:
+            return True
+        return (window + 1) * largest * _WORKING_MEMORY_SLACK <= self.host_budget
 
-    def fits_page_cache(self, streamed, window, budget_used):
+    def fits_page_cache(self, streamed, window, budget_used, largest):
         """Whether every streamed byte fits in the RAM left outside what the model holds."""
         if self.free_ram is None:
             return False
-        ram_used = budget_used if self.unified else (window + 1) * self.largest
+        ram_used = budget_used if self.unified else (window + 1) * largest
         return streamed * _WORKING_MEMORY_SLACK <= self.free_ram - ram_used
 
-    def evaluate(self, window, resident):
-        reserve = self.device_reserve(window)
+    def resident_candidates(self, window):
+        """Yield (resident, largest streamed) pairs that fit the budget with this window.
+
+        For each size threshold, every module above it is kept resident so the reserve only has
+        to hold the largest module still streamed (an embedding or LM head is often several
+        times a decoder layer). The rest of the budget is filled largest-first: resident bytes,
+        not module count, are what save disk reads. Nothing resident is always a candidate,
+        since it leaves the most RAM for the OS page cache.
+        """
+        order = sorted(self.sizes, key=lambda i: (-self.sizes[i], i))
+        yield [], self.largest
+        for limit in sorted(set(self.sizes.values()), reverse=True):
+            forced = [i for i in order if self.sizes[i] > limit]
+            room = self.budget - self.device_reserve(window, limit) - sum(self.sizes[i] for i in forced)
+            if room < 0 or not self.host_fits(window, limit):
+                continue
+            resident = list(forced)
+            for i in order:
+                if self.sizes[i] <= min(limit, room):
+                    resident.append(i)
+                    room -= self.sizes[i]
+            if len(resident) < len(self.sizes):
+                yield sorted(resident), max(self.sizes[i] for i in self.sizes if i not in resident)
+
+    def evaluate(self, window, resident, largest):
+        reserve = self.device_reserve(window, largest)
         resident_bytes = sum(self.sizes[i] for i in resident)
         streamed = self.total - resident_bytes
-        os_cache = self.fits_page_cache(streamed, window, resident_bytes + reserve)
+        os_cache = self.fits_page_cache(streamed, window, resident_bytes + reserve, largest)
         rate = DISK_READ_SPEEDUP_BY_WINDOW[window] * (CACHE_READ_SPEEDUP if os_cache else 1.0)
         strategy = 'single-layer' if window == 0 else ('resident+window' if resident else 'window')
         return SlidingPlan(strategy, resident, window, self.budget, reserve, resident_bytes, streamed,
@@ -154,9 +178,9 @@ def plan_sliding(layer_bytes, budget_bytes, kv_cache_bytes=0, unified_memory=Tru
 
     Per-token time is roughly (bytes still read per token) / (how fast they arrive). Resident
     layers remove bytes, a prefetch window overlaps reads with compute, and RAM left outside the
-    budget serves streamed layers from the OS page cache if they all fit. Every feasible window is
-    tried with the budget either full of resident layers or empty (largest page cache); the
-    fastest estimate wins, ties going to the smaller window. Everything fits -> nothing streams;
+    budget serves streamed layers from the OS page cache if they all fit. Every window is tried
+    with each resident set from _Budget.resident_candidates (or none, the largest page cache);
+    the fastest estimate wins, ties going to the smaller window. Everything fits -> nothing streams;
     the floor is one layer at a time.
 
     layer_bytes: {streamed module index: bytes once loaded}. budget_bytes: memory the model may
@@ -171,10 +195,11 @@ def plan_sliding(layer_bytes, budget_bytes, kv_cache_bytes=0, unified_memory=Tru
                            b.total, 0, False, float('inf'))
     best = None
     for window in range(0, min(max_window, MAX_PREFETCH_WINDOW) + 1):
-        if not b.window_fits(window):
-            break
-        for resident in (plan_resident_layers(b.sizes, budget_bytes, b.device_reserve(window)), []):
-            plan = b.evaluate(window, resident)
+        for resident, largest in b.resident_candidates(window):
+            if b.device_reserve(window, largest) + sum(b.sizes[i] for i in resident) > budget_bytes \
+                    or not b.host_fits(window, largest):
+                continue
+            plan = b.evaluate(window, resident, largest)
             if best is None or plan.est_speedup > best.est_speedup * 1.0001:
                 best = plan
     if best is None:
