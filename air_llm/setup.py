@@ -36,6 +36,8 @@ setuptools.setup(
         'huggingface-hub',
         'scipy',
         'sentencepiece',
+        # Free-RAM checks for sliding adaptive processing (falls back to os.sysconf without it).
+        'psutil',
         # 'bitsandbytes' is optional (used only for --compression); we fall back gracefully when absent.
         # 'compressed-tensors' is optional too: only checkpoints stored in that format (Kimi K3's
         # MXFP4 weights) need it, and transformers raises a clear error naming it when it is missing.
