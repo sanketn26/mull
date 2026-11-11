@@ -139,6 +139,26 @@ model = AutoModel.from_pretrained("garage-bAInd/Platypus2-70B-instruct",
                     )
 ```
 
+#### On macOS (MLX)
+
+No bitsandbytes needed: the same `compression='4bit'` / `'8bit'` stores the layers MLX-quantized (groups of 64, one fp16 scale and bias per group) and runs them with MLX's quantized layers, which multiply without expanding the weights. So unlike the CUDA path, layers kept in memory by sliding adaptive processing are also 2-4x smaller, and more of them fit.
+
+```python
+model = AutoModel.from_pretrained("meta-llama/Llama-3.3-70B-Instruct", compression='4bit')
+```
+
+or `make run MODEL=... COMPRESSION=4bit`. The compressed split is written once to its own folder (`splitted_model.4bit`).
+
+Measured with TinyLlama-1.1B on Apple silicon:
+
+| | fp16 | 8bit | 4bit |
+|---|---|---|---|
+| layer files read per token | 2.20GB | 1.17GB | 0.62GB |
+| speed, layers kept in memory | 22.5ms | 12.9ms | 10.4ms |
+| greedy output vs. fp16 | - | same text for 8-32 tokens, then a different but sensible continuation | same for 3-32 tokens, then different but sensible |
+
+When a model is bigger than RAM, time per token is roughly the bytes read divided by SSD speed, so 8bit is ~1.9x and 4bit ~3.5x faster. For small models whose files already sit in the OS cache, streaming is dominated by a fixed ~2-3ms per-layer cost, and compression helps mainly through faster resident layers.
+
 #### What are the differences between model compression and quantization?
 
 Quantization normally needs to quantize both weights and activations to really speed things up. Which makes it harder to maintain accuracy and avoid the impact of outliers in all kinds of inputs.
@@ -149,12 +169,35 @@ While in our case the bottleneck is mainly at the disk loading, we only need to 
  
 When initialize the model, we support the following configurations:
 
-* **compression**: supported options: 4bit, 8bit for 4-bit or 8-bit block-wise quantization, or by default None for no compression
+* **compression**: supported options: 4bit, 8bit for 4-bit or 8-bit block-wise quantization, or by default None for no compression (bitsandbytes on CUDA; MLX-native on macOS, see [Model Compression](#model-compression---3x-inference-speed-up))
 * **profiling_mode**: supported options: True to output time consumptions or by default False
 * **layer_shards_saving_path**: optionally another path to save the split model
 * **hf_token**: huggingface token can be provided here if downloading gated models like: *meta-llama/Llama-2-7b-hf*
 * **prefetching**: prefetching to overlap the model loading and compute. By default, turned on. For now, only AirLLMLlama2 supports this.
 * **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space. 
+* **memory_percent**: share of the memory free at load time (VRAM on CUDA, system RAM on Apple silicon and CPU) that **sliding adaptive processing** may use. Default `25`; `0` turns it off. See below.
+
+### Sliding adaptive processing
+
+By default AirLLM keeps one layer in memory at a time and re-reads every other layer from disk for each token, so speed is set by how many bytes it reads per token and how fast they arrive. Sliding adaptive processing looks at the layer sizes, the free memory and `memory_percent`, estimates the time per token for each option and picks the fastest:
+
+* **everything fits**: load all layers once; nothing streams.
+* **keep some layers resident**: those are never re-read; the rest slide through a small prefetch window that reads the next layer while the current one runs.
+* **keep the model in the OS page cache**: if the streamed layers fit in the RAM left over, the planner keeps its own footprint small so they stay cached (about 3x faster than reading the SSD).
+* **one layer at a time**: the floor when the budget is too small for anything else.
+
+It prints its decision when the model loads:
+
+```
+sliding adaptive processing: 17 modules resident, the rest slide through a 2-layer prefetch window.
+Budget 8.15GB (50% of 16.30GB free); 6.18GB resident, 23.56GB read per token mostly from the SSD ...
+```
+
+```python
+model = AutoModel.from_pretrained("meta-llama/Llama-3.3-70B-Instruct", memory_percent=50)
+```
+
+Measured on Apple silicon (M-series, 24GB) with a 32GB model, about twice the free RAM: 5.1s per token with it off, 4.45s at 25%, 4.2s at 50%. With a 16GB model that fits in free RAM: 935ms off, 733ms at 25%.
 
 ## MacOS
 
