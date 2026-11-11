@@ -1,10 +1,10 @@
-# AirLLM fork: next-steps plan
+# Mull: next-steps plan
 
 Last updated 2026-11-11. Collaborative copy: https://claude.ai/artifact/VKVsAfoqwNgWHvVEikuK4f
 
 ## Goal
 
-Run models larger than RAM — Qwen and coding models first — on a 24 GB Apple-silicon Mac, as a standalone local tool with a web interface for background work and delayed processing. Inputs are text, audio and video; output is text. The fork is independent of upstream (lyogavin/airllm) and is not published to PyPI.
+Run models larger than RAM — Qwen and coding models first — on a 24 GB Apple-silicon Mac, as a standalone local tool with a web interface for background work and delayed processing. Inputs are text, audio and video; output is text. Mull is a fork of AirLLM (lyogavin/airllm, Apache 2.0); it does not sync with upstream and is not published to PyPI. Renaming the `airllm` import package is a later, separate step.
 
 For models bigger than RAM, speed is set by bytes read from the SSD per token, about 6 GB/s on this machine. The levers are therefore: read fewer bytes, read them once for several tokens, or read them once for several prompts.
 

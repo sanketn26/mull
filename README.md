@@ -1,53 +1,21 @@
-![airllm_logo](https://github.com/lyogavin/airllm/blob/main/assets/airllm_logo_sm.png?v=3&raw=true)
+# Mull
 
-[**Quickstart**](#quickstart) | 
-[**Configurations**](#configurations) | 
-[**MacOS**](#macos) | 
-[**Example notebooks**](#example-python-notebook) | 
-[**FAQ**](#faq)
+**Mull** runs language models larger than your machine's memory by streaming them from disk one layer at a time, and is being built into a local tool for background work: queue a job, let it think, come back for the answer. It targets Apple-silicon Macs first.
 
-**AirLLM** dramatically reduces inference memory usage, letting 70B large language models run on a single 4GB GPU card — without quantization, distillation, or pruning. You can even run **Kimi K3 (2.8T)** — the largest open-source model released to date — on **under 4GB**, **Qwen3.8-Flash-Next (125B)** on **6GB**, and **DeepSeek-V3 (671B)** on **~12GB**. We now also support training huge models on small VRAM: **Qwen3.8-Flash-Next (125B)** under **6GB**.
+## Where this comes from
 
-[![Downloads](https://static.pepy.tech/personalized-badge/airllm?period=total&units=international_system&left_color=grey&right_color=blue&left_text=downloads)](https://pepy.tech/project/airllm)
+Mull is a fork of [**AirLLM**](https://github.com/lyogavin/airllm) by Gavin Li, released under the Apache License 2.0. The core idea — build the model empty, then load, run and drop each layer in turn — and most of the model support are AirLLM's work, which in turn credits [SimJeg's Kaggle code](#acknowledgement). Mull keeps that code, its license and its history, and does not sync with upstream.
 
-[![Code License](https://img.shields.io/badge/Code%20License-Apache_2.0-green.svg)](https://github.com/LianjiaTech/BELLE/blob/main/LICENSE)
-[![PyPI - AirLLM](https://img.shields.io/pypi/format/airllm?logo=pypi&color=3571a3)
-](https://pypi.org/project/airllm/)
+What Mull has changed so far (details in [docs/PLAN.md](docs/PLAN.md)):
 
-## Updates
-[2026/09] **Training** support: stream frozen weights one layer at a time and keep adapters on the GPU. **Qwen3.8-Flash-Next (125B)** trains under **6GB** (RTX 3060 Ti); **Qwen3.8-27B** trains in **~2GB** at seq 512. See [Training](#training).
+- 3–7× faster per token from selective garbage collection, and a faster direct-read loader.
+- Sliding adaptive processing: keeps as many layers in memory as a percentage budget allows, with a guarded read-ahead window.
+- MLX 4-bit / 8-bit quantization and a faster layer format on macOS.
+- A refactor into smaller modules, with offline end-to-end tests.
 
-[2026/08] **Qwen3.8-Flash-Next** support: Qwen's 125B MoE flagship (`Qwen4ExpForConditionalGeneration`) with a ~51B n-gram embedding runs in **5.95GB** of VRAM, measured end to end on one RTX 4090. The n-gram table is file-mapped on the host (a 64GB machine is enough); decoder layers stream. Needs a `transformers` build with in-tree `qwen4_exp` (`pip install git+https://github.com/huggingface/transformers.git` today) and ~360GB of checkpoint disk (`delete_original=True` reclaims the originals after the split).
+What is next: Qwen and coding models on the Mac, a background job server with a web interface, batching, and audio- and video-to-text. See [docs/PLAN.md](docs/PLAN.md).
 
-[2026/08] **Qwen3.8-27B** support: Qwen's new dense VL (Gated DeltaNet + Gated Attention, native vision) runs in **3.33GB** of VRAM, measured end to end on one RTX 3090. Needs `transformers` 5.8+.
-
-[2026/07] **Kimi K3 (2.8T)** support: the largest open-source model runs on a single card in **3.72GB** of VRAM, measured end to end on one RTX 6000 Ada. Per-expert streaming loads only the experts a token actually routes to. K3 brings three requirements of its own: `pip install compressed-tensors flash-attn` (its model code mandates flash attention regardless of what you request), a CUDA 12 build of torch, since no prebuilt flash-attn wheel exists for CUDA 13 yet, and `transformers` 4.56.x, as its remote code does not load on 5.x.
-
-[2026/06] **v3.0**: FP8 model support + the latest models. Run **DeepSeek-V3 (671B) on ~12GB** and **Qwen3-235B on ~3GB**, plus Qwen3, Llama 3.x/4, DeepSeek V2/V3, Phi-4, Gemma and more — all through a single `AutoModel`.
-
-[2024/08/20] v2.11.0: Support Qwen2.5
-
-[2024/08/18] v2.10.1 Support CPU inference. Support non sharded models. Thanks @NavodPeiris for the great work! 
-
-[2024/07/30] Support Llama3.1 **405B** ([example notebook](https://colab.research.google.com/github/lyogavin/airllm/blob/main/air_llm/examples/run_llama3.1_405B.ipynb)). Support **8bit/4bit quantization**.
-
-[2024/04/20] AirLLM supports Llama3 natively already. Run Llama3 70B on 4GB single GPU.
-
-[2023/12/25] v2.8.2: Support MacOS running 70B large language models.
-
-[2023/12/20] v2.7: Support AirLLMMixtral. 
-
-[2023/12/20] v2.6: Added AutoModel, automatically detect model type, no need to provide model class to initialize model.
-
-[2023/12/18] v2.5: added prefetching to overlap the model loading and compute. 10% speed improvement.
-
-[2023/12/03] added support of **ChatGLM**, **QWen**, **Baichuan**, **Mistral**, **InternLM**!
-
-[2023/12/02] added support for safetensors. Now support all top 10 models in open llm leaderboard.
-
-[2023/12/01] airllm 2.0. Support compressions: **3x run time speed up!**
-
-[2023/11/20] airllm Initial version!
+**Be aware:** the Python package and imports are still named `airllm`, and many classes keep their AirLLM names. Claims and examples below that come from AirLLM — CUDA results, very large models such as Kimi K3 or DeepSeek-V3, Colab notebooks — were measured upstream and have **not** been re-verified in this fork, which is developed on a Mac without an NVIDIA GPU. They are kept for reference.
 
 ## Table of Contents
 
@@ -58,6 +26,7 @@
 * [Example notebooks](#example-python-notebook)
 * [Supported Models](#supported-models)
 * [Training](#training)
+* [AirLLM release history](#airllm-release-history)
 * [Acknowledgement](#acknowledgement)
 * [FAQ](#faq)
 
@@ -65,10 +34,11 @@
 
 ### 1. Install package
 
-First, install the airllm pip package.
+Mull is not published to PyPI. Clone the repo and install it locally:
 
 ```bash
-pip install airllm
+git clone https://github.com/sanketn26/airllm.git mull && cd mull
+make setup      # creates .venv and installs the package (import name: airllm)
 ```
 
 ### 2. Inference
@@ -399,6 +369,44 @@ trainer.save_adapter("qwen38-flash-next-lora.pt")
 
 `AirLLMLoRA` is the same API for `Qwen/Qwen3.8-27B`.
 
+## AirLLM release history
+
+Upstream AirLLM's changelog, kept for reference. These results were measured by AirLLM, not re-verified in Mull.
+
+[2026/09] **Training** support: stream frozen weights one layer at a time and keep adapters on the GPU. **Qwen3.8-Flash-Next (125B)** trains under **6GB** (RTX 3060 Ti); **Qwen3.8-27B** trains in **~2GB** at seq 512. See [Training](#training).
+
+[2026/08] **Qwen3.8-Flash-Next** support: Qwen's 125B MoE flagship (`Qwen4ExpForConditionalGeneration`) with a ~51B n-gram embedding runs in **5.95GB** of VRAM, measured end to end on one RTX 4090. The n-gram table is file-mapped on the host (a 64GB machine is enough); decoder layers stream. Needs a `transformers` build with in-tree `qwen4_exp` (`pip install git+https://github.com/huggingface/transformers.git` today) and ~360GB of checkpoint disk (`delete_original=True` reclaims the originals after the split).
+
+[2026/08] **Qwen3.8-27B** support: Qwen's new dense VL (Gated DeltaNet + Gated Attention, native vision) runs in **3.33GB** of VRAM, measured end to end on one RTX 3090. Needs `transformers` 5.8+.
+
+[2026/07] **Kimi K3 (2.8T)** support: the largest open-source model runs on a single card in **3.72GB** of VRAM, measured end to end on one RTX 6000 Ada. Per-expert streaming loads only the experts a token actually routes to. K3 brings three requirements of its own: `pip install compressed-tensors flash-attn` (its model code mandates flash attention regardless of what you request), a CUDA 12 build of torch, since no prebuilt flash-attn wheel exists for CUDA 13 yet, and `transformers` 4.56.x, as its remote code does not load on 5.x.
+
+[2026/06] **v3.0**: FP8 model support + the latest models. Run **DeepSeek-V3 (671B) on ~12GB** and **Qwen3-235B on ~3GB**, plus Qwen3, Llama 3.x/4, DeepSeek V2/V3, Phi-4, Gemma and more — all through a single `AutoModel`.
+
+[2024/08/20] v2.11.0: Support Qwen2.5
+
+[2024/08/18] v2.10.1 Support CPU inference. Support non sharded models. Thanks @NavodPeiris for the great work! 
+
+[2024/07/30] Support Llama3.1 **405B** ([example notebook](https://colab.research.google.com/github/lyogavin/airllm/blob/main/air_llm/examples/run_llama3.1_405B.ipynb)). Support **8bit/4bit quantization**.
+
+[2024/04/20] AirLLM supports Llama3 natively already. Run Llama3 70B on 4GB single GPU.
+
+[2023/12/25] v2.8.2: Support MacOS running 70B large language models.
+
+[2023/12/20] v2.7: Support AirLLMMixtral. 
+
+[2023/12/20] v2.6: Added AutoModel, automatically detect model type, no need to provide model class to initialize model.
+
+[2023/12/18] v2.5: added prefetching to overlap the model loading and compute. 10% speed improvement.
+
+[2023/12/03] added support of **ChatGLM**, **QWen**, **Baichuan**, **Mistral**, **InternLM**!
+
+[2023/12/02] added support for safetensors. Now support all top 10 models in open llm leaderboard.
+
+[2023/12/01] airllm 2.0. Support compressions: **3x run time speed up!**
+
+[2023/11/20] airllm Initial version!
+
 ## Acknowledgement
 
 A lot of the code are based on SimJeg's great work in the Kaggle exam competition. Big shoutout to SimJeg:
@@ -458,8 +466,8 @@ input_tokens = model.tokenizer(input_text,
 
 ## Citing AirLLM
 
-If you find
-AirLLM useful in your research and wish to cite it, please use the following
+Mull is built on AirLLM. If you find
+it useful in your research and wish to cite it, please use the following
 BibTex entry:
 
 ```

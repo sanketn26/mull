@@ -1,0 +1,15 @@
+Mull
+Copyright 2026 Sanket Naik
+
+This product is a modified version of AirLLM
+(https://github.com/lyogavin/airllm), Copyright 2023 Gavin Li,
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Changes from AirLLM are recorded in this repository's git history
+and summarised in README.md and docs/PLAN.md.
+
+AirLLM credits portions of its code to SimJeg's Kaggle notebook
+(https://www.kaggle.com/code/simjeg/platypus2-70b-with-wikipedia-rag).
+
+air_llm/airllm/tokenization_baichuan.py is third-party code from Baichuan Inc.
+(with EleutherAI and Hugging Face notices), kept as distributed.

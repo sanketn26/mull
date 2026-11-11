@@ -1,4 +1,4 @@
-# Developer entry points for AirLLM.
+# Developer entry points for Mull (a fork of AirLLM; import package: airllm).
 #
 #   make setup   create .venv and install the package (editable) plus dev tools
 #   make run     generate tokens (MODEL=, PROMPT=, MAX_NEW_TOKENS=, COMPRESSION=4bit|8bit, MEMORY_PERCENT=)
