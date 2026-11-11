@@ -30,7 +30,7 @@ The fork is 2–8× faster per token than the original code and passes 120 tests
 
 Gaps:
 
-- **Not yet measured on a model bigger than RAM** for the MLX path or 4-bit; those gains are estimates.
+- **Measured on Llama-3.1-8B (bigger than free RAM):** fp16 1.95–3.16 s/token, 4-bit 0.06–0.17 s/token (see README). 8-bit and 70B are not yet measured.
 - **Untested here:** CUDA (no NVIDIA GPU), the compressed-tensors path used by Kimi K3, and the example training scripts' loop.
 - **Mac model support:** MLX runs only Llama and Mistral. Kimi K3 cannot run on this machine (needs CUDA and ~1.6 TB of disk).
 

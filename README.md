@@ -34,6 +34,22 @@ All numbers below were measured on a 24 GB Apple-silicon Mac.
 | MLX 4-bit / 8-bit quantization | 3.5× fewer bytes read per token (4-bit) |
 | MLX safetensors layer files | 155 → 70 ms/token |
 | Prefetch memory guard | Read-ahead stops before free RAM falls below 10% |
+| Read-ahead without MLX in the worker thread | Llama-3.1-8B 4-bit: 1.67 → 0.17 s/token |
+| Splitter reads per tensor, not per shard | Peak memory while splitting Llama-3.1-8B: 7.6 → 4.0 GB |
+
+### Llama-3.1-8B-Instruct on a 24 GB Mac
+
+The fp16 model is 15 GB, more than the 10–14 GB of RAM that was free, so it streams from the SSD. Each figure is one run of 15 tokens, including the prompt.
+
+| Mode | s/token | Peak memory | Output |
+| --- | --- | --- | --- |
+| fp16, `memory_percent=0` (one layer at a time) | 3.16 | 2.0 GB | "The vast expanse of the sea stretches out to the horizon, its waves" |
+| fp16, 25% | 2.56 | 3.0 GB | same |
+| fp16, 50% | 1.95 | 4.5 GB | same |
+| 4-bit, 25% | **0.17** | 3.0 GB | "The vast and mysterious ocean covers over 70% of the Earth's surface" |
+| 4-bit, 50% (whole model in memory) | **0.06** | 5.0 GB | same as 4-bit, 25% |
+
+fp16 is limited by the SSD (about 6 GB/s). 4-bit reads 3.5× fewer bytes, and those bytes fit in the OS page cache. The planner adapts to the RAM that is free when the model loads, so results at a given percentage vary with what else is running.
 
 The code was also split into smaller modules with offline end-to-end tests, and no function is longer than 50 lines.
 
@@ -108,7 +124,7 @@ Measured with TinyLlama-1.1B on Apple silicon:
 | speed, layers kept in memory | 22.5 ms | 12.9 ms | 10.4 ms |
 | greedy output vs. fp16 | – | same for 8–32 tokens, then different but sensible | same for 3–32 tokens, then different but sensible |
 
-For a model larger than RAM, the time per token is roughly the bytes read divided by the SSD speed. That makes 8bit about 1.9× faster and 4bit about 3.5× faster, but this is an estimate and has not yet been measured.
+On a model larger than RAM the gain is larger than the bytes saved: Llama-3.1-8B went from 3.16 s/token (fp16) to 0.17 s/token (4-bit) at 25%, because the 4-bit layers also fit in the OS page cache. See [the table above](#llama-31-8b-instruct-on-a-24-gb-mac). 8-bit has not been measured on this model.
 
 ## Development
 
