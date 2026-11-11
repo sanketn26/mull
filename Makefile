@@ -17,12 +17,12 @@ MAX_NEW_TOKENS ?= 20
 COMPRESSION    ?=
 MEMORY_PERCENT ?=
 
-# The macOS backend is MLX; it is not a dependency in setup.py, so install it here.
+# Extras from pyproject.toml: the MLX runtime on macOS, plus test and lint tools everywhere.
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
-PLATFORM_DEPS := mlx psutil
+EXTRAS := mac,dev
 else
-PLATFORM_DEPS :=
+EXTRAS := dev
 endif
 
 PYTEST_ARGS ?=
@@ -38,10 +38,10 @@ $(BIN)/python:
 	$(BIN)/pip install --upgrade pip
 
 setup: $(BIN)/python
-	$(BIN)/pip install -e . $(PLATFORM_DEPS) pytest ruff
+	$(BIN)/pip install -e ".[$(EXTRAS)]"
 
 run: $(BIN)/python
-	$(BIN)/python run_inference.py --model "$(MODEL)" --prompt "$(PROMPT)" \
+	$(BIN)/python examples/run_inference.py --model "$(MODEL)" --prompt "$(PROMPT)" \
 		--max-new-tokens $(MAX_NEW_TOKENS) \
 		$(if $(COMPRESSION),--compression $(COMPRESSION)) \
 		$(if $(MEMORY_PERCENT),--memory-percent $(MEMORY_PERCENT))

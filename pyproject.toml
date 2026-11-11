@@ -1,0 +1,37 @@
+# Mull: an adaptation of AirLLM (Gavin Li, Apache 2.0). Import package: `mull`.
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mull"
+version = "0.1.0"
+description = "Runs language models larger than memory by streaming layers from disk, for background work on Apple silicon. An adaptation of AirLLM."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Sanket Naik" }, { name = "Gavin Li (AirLLM)" }]
+dependencies = [
+    "tqdm",
+    "torch>=2.4",
+    "transformers>=4.49,<6",
+    "accelerate>=1.0",
+    "safetensors",
+    "huggingface-hub",
+    "scipy",
+    "sentencepiece",
+    "psutil",  # free-RAM checks for sliding adaptive processing
+]
+
+[project.optional-dependencies]
+mac = ["mlx"]                      # the macOS runtime
+cuda = ["bitsandbytes"]            # 4/8-bit compression on CUDA
+kimi = ["compressed-tensors"]      # only for checkpoints stored in that format (Kimi K3)
+dev = ["pytest", "ruff"]
+
+[project.urls]
+Homepage = "https://github.com/sanketn26/mull"
+Upstream = "https://github.com/lyogavin/airllm"
+
+[tool.setuptools.packages.find]
+include = ["mull", "mull.*"]

@@ -1,4 +1,4 @@
-"""Generate a few tokens with AirLLM. Used by `make run`.
+"""Generate a few tokens with Mull. Used by `make run`.
 
 Works on both backends: MLX on macOS (returns the decoded text directly) and the PyTorch
 streaming path elsewhere (returns token ids).
