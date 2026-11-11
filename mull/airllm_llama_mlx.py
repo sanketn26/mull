@@ -1,6 +1,4 @@
 """MLX runtime for macOS: streams Llama-style models block by block (see mlx_llama.py)."""
-import threading
-
 import mlx.core as mx
 import mlx.nn as nn
 import psutil
@@ -18,8 +16,8 @@ from .persist.mlx_model_persister import QUANT_BITS, QUANT_GROUP_SIZE, MlxModelP
 from .prefetch import PrefetchWindow
 from .sliding import DEFAULT_MEMORY_PERCENT, MAX_PREFETCH_WINDOW, plan_sliding, validate_memory_percent
 
-# Per prefetch-thread MLX stream (MLX streams are thread-local).
-_worker_streams = threading.local()
+# Read-ahead reads layer files in chunks of this size, warming the OS page cache.
+_WARM_CHUNK_BYTES = 64 << 20
 
 
 class AirLLMLlamaMlx:
@@ -107,7 +105,7 @@ class AirLLMLlamaMlx:
         self._resident_names = self._plan_resident()
         self.prefetch_window = PrefetchWindow(
             [n for n in self.layer_names if n not in self._resident_names],
-            load=self._load_weights_in_worker, load_now=self._load_weights,
+            load=self._warm_layer_file, load_now=lambda name: name,
             size=self._window, size_of=self._layer_file_bytes)
 
     def get_tokenizer(self, hf_token=None):
@@ -137,22 +135,30 @@ class AirLLMLlamaMlx:
                             max_window=MAX_PREFETCH_WINDOW if self.prefetching else 0,
                             free_ram_bytes=available)
         self.sliding_plan = plan
-        self._window = plan.window
+        # When every streamed byte already fits in the OS page cache, read-ahead only adds work:
+        # measured on Llama-3.1-8B 4-bit, 0.12 s/token without it vs 0.18 s with it.
+        self._window = 0 if plan.os_cache else plan.window
         print(plan.describe(self.memory_percent, available))
+        if self._window != plan.window:
+            print("MLX: read-ahead off, since the streamed layers are served from the OS page cache.")
         return {self.layer_names[i] for i in plan.resident}
 
     def _load_weights(self, name):
         return self.persister.load_model(name, self.checkpoint_path)
 
-    def _load_weights_in_worker(self, name):
-        """Prefetch-thread loader. MLX streams are per thread, so each worker needs its own."""
-        stream = getattr(_worker_streams, 'cpu', None)
-        if stream is None:
-            stream = _worker_streams.cpu = mx.new_stream(mx.cpu)
-        with mx.stream(stream):
-            weights = self._load_weights(name)
-            mx.eval(weights)   # read the file here, on the worker, not later on the main thread
-        return weights
+    def _warm_layer_file(self, name):
+        """Read-ahead: read the layer's file so the main thread's mx.load finds it in the page cache.
+
+        The worker deliberately creates no MLX arrays: MLX work on a second thread slowed every
+        GPU op on the main thread (measured 7x slower decode on Llama-3.1-8B 4-bit). Plain reads
+        overlap the SSD with compute (fp16 2.59 -> 2.18 s/token) and hold one reusable buffer.
+        """
+        path = self.persister.layer_file(name, self.checkpoint_path)
+        buf = bytearray(_WARM_CHUNK_BYTES)
+        with open(path, 'rb', buffering=0) as f:
+            while f.readinto(buf):
+                pass
+        return name
 
     def _layer_file_bytes(self, name):
         """On-disk size of a layer's shard, cached: asked before every read-ahead."""
@@ -184,7 +190,7 @@ class AirLLMLlamaMlx:
         module = self._resident.get(name)
         if module is None:
             self.record_memory(f'before loading {name}')
-            weights = self.prefetch_window.take(name)
+            weights = self._load_weights(self.prefetch_window.take(name))
             selected = select(weights)
             module = self._quantize_to_match(build(), selected)
             module.update(selected)
