@@ -20,7 +20,7 @@ Mull does not sync with upstream.
 
 Those results were measured by AirLLM, and Mull has not re-verified them. Mull is developed on a Mac without an NVIDIA GPU.
 
-The Python package is still imported as `airllm`, and the classes keep their AirLLM names.
+The package is imported as `mull`; classes keep their AirLLM names (for example `AirLLMLlamaMlx`).
 
 ## What Mull adds
 
@@ -63,7 +63,7 @@ make run MODEL=TinyLlama/TinyLlama-1.1B-Chat-v1.0 PROMPT="What is the capital of
 From Python:
 
 ```python
-from airllm import AutoModel
+from mull import AutoModel
 
 model = AutoModel.from_pretrained("meta-llama/Llama-3.3-70B-Instruct",
                                   compression="4bit", memory_percent=25)
@@ -96,7 +96,7 @@ sliding adaptive processing: 17 modules resident, the rest slide through a 2-lay
 Budget 8.15GB (50% of 16.30GB free); 6.18GB resident, 23.56GB read per token mostly from the SSD ...
 ```
 
-Read-ahead never pushes free RAM below `max(1 GB, 10% of total)`. Override that floor with `AIRLLM_MIN_FREE_RAM_GB`.
+Read-ahead never pushes free RAM below `max(1 GB, 10% of total)`. Override that floor with `MULL_MIN_FREE_RAM_GB`.
 
 ### MLX compression
 

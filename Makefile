@@ -1,4 +1,4 @@
-# Developer entry points for Mull (a fork of AirLLM; import package: airllm).
+# Developer entry points for Mull (a fork of AirLLM; import package: mull).
 #
 #   make setup   create .venv and install the package (editable) plus dev tools
 #   make run     generate tokens (MODEL=, PROMPT=, MAX_NEW_TOKENS=, COMPRESSION=4bit|8bit, MEMORY_PERCENT=)
@@ -10,7 +10,6 @@
 PYTHON         ?= python3.12
 VENV           ?= .venv
 BIN            := $(VENV)/bin
-PKG_DIR        := air_llm
 
 MODEL          ?= TinyLlama/TinyLlama-1.1B-Chat-v1.0
 PROMPT         ?= What is the capital of the United States?
@@ -39,23 +38,23 @@ $(BIN)/python:
 	$(BIN)/pip install --upgrade pip
 
 setup: $(BIN)/python
-	$(BIN)/pip install -e $(PKG_DIR) $(PLATFORM_DEPS) pytest ruff
+	$(BIN)/pip install -e . $(PLATFORM_DEPS) pytest ruff
 
 run: $(BIN)/python
-	$(BIN)/python $(PKG_DIR)/run_inference.py --model "$(MODEL)" --prompt "$(PROMPT)" \
+	$(BIN)/python run_inference.py --model "$(MODEL)" --prompt "$(PROMPT)" \
 		--max-new-tokens $(MAX_NEW_TOKENS) \
 		$(if $(COMPRESSION),--compression $(COMPRESSION)) \
 		$(if $(MEMORY_PERCENT),--memory-percent $(MEMORY_PERCENT))
 
 test: $(BIN)/python
-	cd $(PKG_DIR) && ../$(BIN)/python -m pytest tests -q $(PYTEST_ARGS)
+	$(BIN)/python -m pytest tests -q $(PYTEST_ARGS)
 
 lint: $(BIN)/python
-	$(BIN)/ruff check $(PKG_DIR)
+	$(BIN)/ruff check .
 
 clean:
-	rm -rf $(PKG_DIR)/build $(PKG_DIR)/dist $(PKG_DIR)/*.egg-info $(PKG_DIR)/README.md
-	rm -rf .pytest_cache .ruff_cache $(PKG_DIR)/.pytest_cache $(PKG_DIR)/.ruff_cache
+	rm -rf build dist *.egg-info
+	rm -rf .pytest_cache .ruff_cache
 	find . -name __pycache__ -type d -not -path './$(VENV)/*' -prune -exec rm -rf {} +
 	find . -name .ipynb_checkpoints -type d -not -path './$(VENV)/*' -prune -exec rm -rf {} +
 

@@ -11,5 +11,5 @@ and summarised in README.md and docs/PLAN.md.
 AirLLM credits portions of its code to SimJeg's Kaggle notebook
 (https://www.kaggle.com/code/simjeg/platypus2-70b-with-wikipedia-rag).
 
-air_llm/airllm/tokenization_baichuan.py is third-party code from Baichuan Inc.
+mull/tokenization_baichuan.py is third-party code from Baichuan Inc.
 (with EleutherAI and Hugging Face notices), kept as distributed.
