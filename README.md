@@ -1,6 +1,6 @@
 # Mull
 
-Mull runs language models that are larger than your machine's memory. It streams them from disk one layer at a time, so a model is never fully loaded. It is being built into a local tool for background work: you queue a job, let it think, and come back for the answer. Apple-silicon Macs are the first target.
+Mull runs language models that are larger than your machine's memory. It streams layers from disk and keeps weights resident when the memory budget allows. It is being built into a local tool for background work: you queue a job, let it think, and come back for the answer. Apple-silicon Macs are the first target.
 
 ## An adaptation of AirLLM
 
@@ -84,18 +84,28 @@ model = AutoModel.from_pretrained("NousResearch/Meta-Llama-3.1-8B-Instruct",
                                   compression="4bit", memory_percent=25)
 ```
 
-On macOS, `AutoModel` returns the MLX runtime. Only Llama-style models (`LlamaForCausalLM` and `MistralForCausalLM`) run there for now; other architectures raise an error before anything is downloaded.
+On macOS, `AutoModel` supports Llama and Mistral checkpoints through the layer splitter. The first load needs roughly one additional copy of the weights on disk. Set `delete_original=True` to remove the downloaded original after the split.
 
-The first load splits the checkpoint into one file per layer. This needs about as much free disk space as the model itself. Set `delete_original=True` to remove the downloaded original after the split.
+The macOS extra also supports native packed MLX checkpoints for Qwen3, Qwen3.5 text, gpt-oss, and Qwen3 MoE. These models read the packed weights from the original shards. Use a local checkpoint directory and leave `compression` unset.
+
+```python
+model = AutoModel.from_pretrained("/path/to/Qwen3-8B-4bit", memory_percent=25)
+ids = model.tokenizer.encode("The capital of France is")
+text = model.generate([ids], max_new_tokens=32)
+```
+
+Packed models generate decoded continuations for one request at a time. The request plan estimates model weight, cache and prefill workspace bytes. Free RAM is measured again for each request. An allocation below the estimated execution footprint streams one module at a time instead of failing; only when even that would not fit in free RAM does it raise `MemoryError`. Set `memory_percent=0` to stream without a residency allocation. Qwen3.5 accepts text tokens. Qwen3 MoE uses whole-block loading by default and accepts `expert_streaming=True` to try the experimental expert cache.
 
 ## Options Mull adds or changes
 
 - **`memory_percent`** (default `25`; `0` turns it off): the share of free memory that sliding adaptive processing may use. On CUDA that memory is VRAM; on Apple silicon and CPU it is system RAM.
 - **`compression`** (`'4bit'` or `'8bit'`): on macOS this uses MLX-native quantization. The quantized split is written once, to its own folder. On CUDA it uses bitsandbytes, as in AirLLM.
 
-Every other option behaves as described in [AirLLM's documentation](https://github.com/lyogavin/airllm#configurations).
+For the layer-splitting backend, other options are described in [AirLLM's documentation](https://github.com/lyogavin/airllm#configurations).
 
 ### Sliding adaptive processing
+
+On Apple silicon, when the streamed weights fit in the OS page cache, the planner uses the read-ahead allowance for resident layers. For a partially resident model, startup also reports the estimated RAM allocation needed to keep every layer resident.
 
 When the model loads, the planner reads three things: the layer sizes, the free memory, and `memory_percent`. It then estimates the time per token for each strategy and picks the fastest:
 

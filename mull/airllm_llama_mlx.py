@@ -1,4 +1,6 @@
 """MLX runtime for macOS: streams Llama-style models block by block (see mlx_llama.py)."""
+import math
+
 import mlx.core as mx
 import mlx.nn as nn
 import psutil
@@ -14,7 +16,7 @@ from .mlx_llama import (  # noqa: F401  (ModelArgs, Attention, ... re-exported f
 )
 from .persist.mlx_model_persister import QUANT_BITS, QUANT_GROUP_SIZE, MlxModelPersister
 from .prefetch import PrefetchWindow
-from .sliding import DEFAULT_MEMORY_PERCENT, MAX_PREFETCH_WINDOW, plan_sliding, validate_memory_percent
+from .sliding import DEFAULT_MEMORY_PERCENT, MAX_PREFETCH_WINDOW, all_resident_budget, plan_sliding, validate_memory_percent
 
 # Read-ahead reads layer files in chunks of this size, warming the OS page cache.
 _WARM_CHUNK_BYTES = 64 << 20
@@ -133,14 +135,17 @@ class AirLLMLlamaMlx:
         kv_cache = 2 * a.n_layers * a.n_kv_heads * a.head_dim * self.max_seq_len * 2
         plan = plan_sliding(sizes, budget, kv_cache_bytes=kv_cache, unified_memory=True,
                             max_window=MAX_PREFETCH_WINDOW if self.prefetching else 0,
-                            free_ram_bytes=available)
+                            free_ram_bytes=available, prefetch_cached_layers=False)
         self.sliding_plan = plan
         # When every streamed byte already fits in the OS page cache, read-ahead only adds work:
         # measured on Llama-3.1-8B 4-bit, 0.12 s/token without it vs 0.18 s with it.
-        self._window = 0 if plan.os_cache else plan.window
+        self._window = plan.window
         print(plan.describe(self.memory_percent, available))
-        if self._window != plan.window:
-            print("MLX: read-ahead off, since the streamed layers are served from the OS page cache.")
+        if plan.streamed_bytes and available:
+            required = all_resident_budget(sizes, kv_cache)
+            allocation = (f"memory_percent={math.ceil(100 * required / available)} at current availability"
+                          if required <= available else "exceeds currently available RAM")
+            print(f"All-resident plan needs {required / 2**30:.2f} GiB ({allocation}).")
         return {self.layer_names[i] for i in plan.resident}
 
     def _load_weights(self, name):

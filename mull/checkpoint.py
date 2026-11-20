@@ -499,3 +499,31 @@ def find_or_create_local_splitted_path(model_local_path_or_repo_id, layer_shards
     return Path(hf_cache_path), split_and_save_layers(
         hf_cache_path, layer_shards_saving_path, repo_id=model_local_path_or_repo_id, hf_token=hf_token,
         **split_kwargs)
+
+
+def safetensor_manifest(path):
+    """Read tensor metadata from a local safetensors checkpoint without loading weights."""
+    path = Path(path)
+    index = path / "model.safetensors.index.json"
+    expected = json.loads(index.read_text())["weight_map"] if index.is_file() else None
+    files = sorted(set(expected.values())) if expected is not None else ["model.safetensors"]
+    manifest = {}
+    for filename in files:
+        if Path(filename).name != filename:
+            raise ValueError(f"Invalid checkpoint shard name: {filename}")
+        with (path / filename).open("rb") as shard:
+            length = int.from_bytes(shard.read(8), "little")
+            if not 0 < length <= 100_000_000:
+                raise ValueError(f"Invalid safetensors header length in {filename}: {length}")
+            header = json.loads(shard.read(length))
+            size = os.fstat(shard.fileno()).st_size - length - 8
+        for key, entry in header.items():
+            if key == "__metadata__":
+                continue
+            start, end = entry["data_offsets"]
+            if key in manifest or not 0 <= start <= end <= size:
+                raise ValueError(f"Invalid safetensors entry {key} in {filename}")
+            manifest[key] = (filename, entry["dtype"], tuple(entry["shape"]), end - start, 8 + length + start)
+    if expected is not None and expected != {key: entry[0] for key, entry in manifest.items()}:
+        raise ValueError("Checkpoint index does not match the safetensors headers")
+    return manifest

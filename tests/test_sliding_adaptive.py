@@ -50,6 +50,15 @@ class TestPlanSliding(unittest.TestCase):
         self.assertEqual(len(plan.resident), 25)
         self.assertLessEqual(plan.resident_bytes + plan.reserve_bytes, plan.budget_bytes)
 
+    def test_mlx_reuses_cached_prefetch_budget_for_residency(self):
+        kwargs = dict(budget_bytes=30 * GB, free_ram_bytes=120 * GB)
+        original = plan_sliding(self.LAYERS, **kwargs)
+        mlx = plan_sliding(self.LAYERS, prefetch_cached_layers=False, **kwargs)
+        self.assertTrue(mlx.os_cache)
+        self.assertEqual(mlx.window, 0)
+        self.assertGreater(mlx.resident_bytes, original.resident_bytes)
+        self.assertLessEqual(mlx.resident_bytes + mlx.reserve_bytes, mlx.budget_bytes)
+
     def test_floor_is_one_layer_at_a_time(self):
         for budget in (int(2.5 * GB), GB // 2):
             plan = plan_sliding(self.LAYERS, budget_bytes=budget)

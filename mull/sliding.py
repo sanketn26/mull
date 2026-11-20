@@ -73,6 +73,16 @@ CACHE_READ_SPEEDUP = 3.0
 _WORKING_MEMORY_SLACK = 1.1  # +10% for activations and allocator fragmentation
 
 
+def _working_reserve(weight_bytes, kv_cache_bytes):
+    return int((weight_bytes + kv_cache_bytes) * _WORKING_MEMORY_SLACK)
+
+
+def all_resident_budget(layer_bytes, kv_cache_bytes, unified_memory=True):
+    """Minimum budget for the planner to select full residency, including its reserve."""
+    largest = max(layer_bytes.values(), default=0)
+    return sum(layer_bytes.values()) + _working_reserve(largest * (2 if unified_memory else 1), kv_cache_bytes)
+
+
 @dataclass
 class SlidingPlan:
     """What sliding adaptive processing decided for one model on one machine."""
@@ -95,6 +105,8 @@ class SlidingPlan:
             'window': f'layers slide through a {self.window}-layer prefetch window',
             'single-layer': 'one layer at a time, no prefetch',
         }[self.strategy]
+        if self.resident and self.strategy == 'single-layer':
+            what = f'{len(self.resident)} modules resident, the rest streamed without prefetch'
         source = ''
         if self.streamed_bytes:
             source = (' from the OS page cache (fits in free RAM)' if self.os_cache
@@ -122,7 +134,7 @@ class _Budget:
         when they share this memory. ``largest``: the biggest module still streamed."""
         largest = self.largest if largest is None else largest
         layers = 2 + window if self.unified else 1
-        return int((layers * largest + self.kv_cache) * _WORKING_MEMORY_SLACK)
+        return _working_reserve(layers * largest, self.kv_cache)
 
     def host_fits(self, window, largest):
         """On a discrete GPU the window waits in host RAM, bounded by host_budget."""
@@ -173,7 +185,8 @@ class _Budget:
 
 
 def plan_sliding(layer_bytes, budget_bytes, kv_cache_bytes=0, unified_memory=True,
-                 host_budget_bytes=None, max_window=MAX_PREFETCH_WINDOW, free_ram_bytes=None):
+                 host_budget_bytes=None, max_window=MAX_PREFETCH_WINDOW, free_ram_bytes=None,
+                 prefetch_cached_layers=True):
     """Sliding adaptive processing: decide how to run a model within a memory budget.
 
     Per-token time is roughly (bytes still read per token) / (how fast they arrive). Resident
@@ -187,10 +200,11 @@ def plan_sliding(layer_bytes, budget_bytes, kv_cache_bytes=0, unified_memory=Tru
     use on the device. kv_cache_bytes: KV cache at full length. unified_memory: device shares
     system RAM (CPU, Apple silicon); on a discrete GPU the window waits in host RAM, bounded by
     host_budget_bytes. max_window: largest window (0 = no prefetch). free_ram_bytes: RAM free now
-    (None = don't count on the page cache).
+    (None = don't count on the page cache). Set prefetch_cached_layers=False for backends
+    that bypass read-ahead when streamed weights fit in the page cache.
     """
     b = _Budget(layer_bytes, budget_bytes, kv_cache_bytes, unified_memory, host_budget_bytes, free_ram_bytes)
-    if b.total + b.device_reserve(0) <= budget_bytes:
+    if all_resident_budget(b.sizes, kv_cache_bytes, unified_memory) <= budget_bytes:
         return SlidingPlan('all-resident', sorted(b.sizes), 0, budget_bytes, b.device_reserve(0),
                            b.total, 0, False, float('inf'))
     best = None
@@ -200,6 +214,8 @@ def plan_sliding(layer_bytes, budget_bytes, kv_cache_bytes=0, unified_memory=Tru
                     or not b.host_fits(window, largest):
                 continue
             plan = b.evaluate(window, resident, largest)
+            if window and plan.os_cache and not prefetch_cached_layers:
+                continue
             if best is None or plan.est_speedup > best.est_speedup * 1.0001:
                 best = plan
     if best is None:
@@ -208,3 +224,15 @@ def plan_sliding(layer_bytes, budget_bytes, kv_cache_bytes=0, unified_memory=Tru
         best = SlidingPlan('single-layer', [], 0, budget_bytes, b.device_reserve(0), 0, b.total, os_cache,
                            DISK_READ_SPEEDUP_BY_WINDOW[0] * (CACHE_READ_SPEEDUP if os_cache else 1.0))
     return best
+
+
+def minimum_execution_budget(layer_bytes, inference_bytes, unified_memory=True):
+    """Lowest allocation admitted by the residency planner without its streaming fallback."""
+    sizes = sorted(layer_bytes.values(), reverse=True)
+    minimum = all_resident_budget(layer_bytes, inference_bytes, unified_memory)
+    resident = 0
+    staging = 2 if unified_memory else 1
+    for size in sizes:
+        minimum = min(minimum, resident + _working_reserve(staging * size, inference_bytes))
+        resident += size
+    return minimum

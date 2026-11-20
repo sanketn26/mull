@@ -1,3 +1,4 @@
+import math
 
 
 import os
@@ -120,3 +121,60 @@ class MlxModelPersister(ModelPersister):
         layer_state_dict = mx.load(str(to_load_path))
         layer_state_dict = map_torch_to_mlx(layer_state_dict)
         return tree_unflatten(list(layer_state_dict.items()))
+
+
+def load_packed_weights(path, manifest, keys):
+    """Read selected arrays from native MLX shards, retaining their packed dtype."""
+    by_file = {}
+    for key in keys:
+        by_file.setdefault(manifest[key][0], []).append(key)
+    selected = {}
+    for filename, names in by_file.items():
+        arrays = mx.load(str(path / filename))
+        selected.update((key, arrays[key]) for key in names)
+    return selected
+
+
+def warm_packed_weights(path, manifest, keys):
+    """Read the selected tensor ranges into the OS page cache without creating MLX arrays."""
+    by_file = {}
+    for key in keys:
+        filename, _, _, size, offset = manifest[key]
+        by_file.setdefault(filename, []).append((offset, size))
+    buffer = memoryview(bytearray(1 << 20))
+    for filename, ranges in by_file.items():
+        with (path / filename).open("rb", buffering=0) as shard:
+            for offset, size in sorted(ranges):
+                shard.seek(offset)
+                while size:
+                    count = shard.readinto(buffer[:size])
+                    if not count:
+                        raise EOFError(f"Incomplete tensor range in {filename}")
+                    size -= count
+
+
+def load_packed_rows(path, manifest, keys, rows):
+    """Load sorted expert rows while keeping their packed bits and coalescing adjacent reads."""
+    from itertools import groupby
+
+    import numpy as np
+
+    groups = [tuple(row for _, row in group)
+              for _, group in groupby(enumerate(rows), lambda item: item[1] - item[0])]
+    dtypes = {"U32": "<u4", "U8": "u1", "BF16": "<u2", "F16": "<f2", "F32": "<f4"}
+    result = {row: {} for row in rows}
+    for key in keys:
+        filename, dtype, shape, size, offset = manifest[key]
+        row_bytes = size // shape[0]
+        with (path / filename).open("rb") as shard:
+            for group in groups:
+                shard.seek(offset + row_bytes * group[0])
+                data = shard.read(row_bytes * len(group))
+                if len(data) != row_bytes * len(group):
+                    raise EOFError(f"Incomplete expert tensor range for {key}")
+                for i, row in enumerate(group):
+                    values = np.frombuffer(data, dtype=dtypes[dtype], count=math.prod(shape[1:]),
+                                           offset=i * row_bytes)
+                    array = mx.array(values).reshape(shape[1:])
+                    result[row][key] = array.view(mx.bfloat16) if dtype == "BF16" else array
+    return result

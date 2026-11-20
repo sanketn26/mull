@@ -1,5 +1,5 @@
 import importlib
-from transformers import AutoConfig
+from transformers import AutoConfig, PretrainedConfig
 from sys import platform
 
 is_on_mac_os = False
@@ -26,9 +26,11 @@ ARCH_OVERRIDES = {
     "Qwen4ExpForConditionalGeneration": "AirLLMQwen4Exp",
 }
 
-# On macOS every model goes through AirLLMLlamaMlx, an MLX port of the Llama decoder block, so only
-# checkpoints with that layout can run there. Mistral uses the same block and weight names.
+# Llama and Mistral share the legacy MLX block and weight layout.
 MLX_ARCHITECTURES = {"LlamaForCausalLM", "MistralForCausalLM"}
+PACKED_MLX_ARCHITECTURES = {
+    "Qwen3ForCausalLM", "Qwen3_5ForConditionalGeneration", "GptOssForCausalLM", "Qwen3MoeForCausalLM",
+}
 
 
 class AutoModel:
@@ -65,11 +67,24 @@ class AutoModel:
         if is_on_mac_os:
             # Check this before AirLLMLlamaMlx downloads and splits the whole checkpoint, otherwise an
             # unsupported model only fails (or gives garbage) after that is done.
-            arch = AutoModel.get_architecture(pretrained_model_name_or_path, *inputs, **kwargs)
+            config, _ = PretrainedConfig.get_config_dict(
+                pretrained_model_name_or_path, token=kwargs.get("hf_token"), revision=kwargs.get("revision"),
+            )
+            architectures = config.get("architectures") or [""]
+            arch = architectures[0]
+            if arch in PACKED_MLX_ARCHITECTURES:
+                try:
+                    from .airllm_packed_mlx import AirLLMPackedMlx
+                except ModuleNotFoundError as error:
+                    if error.name != "mlx_lm":
+                        raise
+                    raise ImportError("Native packed MLX models require the mac extra on Python 3.10+") from error
+
+                return AirLLMPackedMlx(pretrained_model_name_or_path, *inputs, **kwargs)
             if arch and arch not in MLX_ARCHITECTURES:
                 raise ValueError(
-                    f"{arch} is not supported on macOS yet. The macOS backend (MLX) only runs "
-                    f"Llama-style models: {', '.join(sorted(MLX_ARCHITECTURES))}."
+                    f"{arch} is not supported on macOS. Supported architectures include "
+                    f"{', '.join(sorted(MLX_ARCHITECTURES | PACKED_MLX_ARCHITECTURES))}."
                 )
             return AirLLMLlamaMlx(pretrained_model_name_or_path, *inputs, **kwargs)
 

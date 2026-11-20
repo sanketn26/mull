@@ -4,6 +4,7 @@ Works on both backends: MLX on macOS (returns the decoded text directly) and the
 streaming path elsewhere (returns token ids).
 """
 import argparse
+import sys
 import time
 
 from mull import AutoModel
@@ -38,12 +39,10 @@ def main():
 
     prompt = args.prompt if args.raw else as_chat(model.tokenizer, args.prompt)
     start = time.time()
-    if type(model).__name__ == "AirLLMLlamaMlx":
-        import mlx.core as mx
-
-        tokens = model.tokenizer([prompt], return_tensors="np", return_attention_mask=False,
-                                 truncation=True, max_length=args.max_length, add_special_tokens=args.raw)
-        text = model.generate(mx.array(tokens["input_ids"]), max_new_tokens=args.max_new_tokens)
+    if sys.platform == "darwin":
+        ids = model.tokenizer.encode(prompt, truncation=True, max_length=args.max_length,
+                                     add_special_tokens=args.raw)
+        text = model.generate([ids], max_new_tokens=args.max_new_tokens)
     else:
         tokens = model.tokenizer([prompt], return_tensors="pt", return_attention_mask=False,
                                  truncation=True, max_length=args.max_length, add_special_tokens=args.raw)
