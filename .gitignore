@@ -9,3 +9,6 @@ __pycache__
 .pytest_cache
 .ruff_cache
 .prof
+
+# job server database
+mull-jobs.sqlite3*

@@ -96,6 +96,19 @@ text = model.generate([ids], max_new_tokens=32)
 
 Packed models generate decoded continuations for one request at a time. The request plan estimates model weight, cache and prefill workspace bytes. Free RAM is measured again for each request. An allocation below the estimated execution footprint streams one module at a time instead of failing; only when even that would not fit in free RAM does it raise `MemoryError`. Set `memory_percent=0` to stream without a residency allocation. Qwen3.5 accepts text tokens. Qwen3 MoE uses whole-block loading by default and accepts `expert_streaming=True` to try the experimental expert cache.
 
+## Background job server
+
+Queue prompts over HTTP and let one worker run them on a loaded packed MLX model. Jobs are kept in SQLite, so they survive a restart: a job that was running when the server stopped is queued again.
+
+```bash
+make serve MODEL=/path/to/Qwen3-8B-4bit      # http://127.0.0.1:8765/ shows a status page
+curl -X POST localhost:8765/jobs -d '{"prompt": "Explain this stack trace ...", "max_new_tokens": 512}'
+curl localhost:8765/jobs/1                    # state, tokens so far, output
+curl -X POST localhost:8765/jobs/1/cancel
+```
+
+Jobs run one at a time, in order. Output is saved as it is generated, and a cancelled job stops at its next token. A full queue returns 429. A job that needs more memory than is free fails with a message instead of pushing the machine into swap. The server listens on localhost only and has no authentication. Batching is next.
+
 ## Options Mull adds or changes
 
 - **`memory_percent`** (default `25`; `0` turns it off): the share of free memory that sliding adaptive processing may use. On CUDA that memory is VRAM; on Apple silicon and CPU it is system RAM.
