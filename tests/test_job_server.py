@@ -9,7 +9,7 @@ import urllib.request
 
 from mull.server.http import make_server
 from mull.server.store import JobStore, QueueFull
-from mull.server.worker import Worker
+from mull.server.worker import Worker, cut_at_stop, split_reasoning
 
 
 class FakeRunner:
@@ -20,15 +20,19 @@ class FakeRunner:
         self.gate.set()
         self.closed = 0
 
-    def encode(self, prompt):
+    def encode(self, prompt, system=None, thinking=False):
         if prompt == "boom":
             raise RuntimeError("bad input")
+        self.last = {"system": system, "thinking": thinking}
         return [ord(c) for c in prompt]
 
     def decode(self, ids):
         return "".join(chr(i) for i in ids)
 
-    def tokens(self, ids, max_new_tokens):
+    def describe(self):
+        return {"model": "fake"}
+
+    def tokens(self, ids, max_new_tokens, temperature=0.0):
         if ids == [ord(c) for c in "huge"]:
             raise MemoryError("needs 99 GB")
         try:
@@ -185,11 +189,120 @@ class TestHttpApi(unittest.TestCase):
             self.assertEqual(self.call("/jobs", {"prompt": "a"})[0], 202)
         self.assertEqual(self.call("/jobs", {"prompt": "a"})[0], 429)
 
-    def test_status_page_is_served(self):
-        status, body = self.call("/")
-        self.assertEqual(status, 200)
-        self.assertIn(b"Mull jobs", body)
+    def test_no_web_interface_unless_asked(self):
+        self.assertEqual(self.call("/")[0], 404)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOutputHandling(unittest.TestCase):
+    def test_reasoning_is_split_from_the_answer(self):
+        self.assertEqual(split_reasoning("<think>\nhmm\n</think>\n\nParis"), ("Paris", "hmm"))
+        self.assertEqual(split_reasoning("<think>still going"), ("", "still going"))
+        self.assertEqual(split_reasoning("Paris"), ("Paris", ""))
+
+    def test_stop_sequences_cut_at_the_earliest(self):
+        self.assertEqual(cut_at_stop("a END b STOP", ["STOP", "END"]), "a ")
+        self.assertIsNone(cut_at_stop("abc", ["x"]))
+
+
+class TestJobOptions(unittest.TestCase):
+    def setUp(self):
+        self.store = JobStore(":memory:")
+        self.runner = FakeRunner()
+        self.worker = Worker(self.store, self.runner)
+
+    def test_options_reach_the_runner_and_stop_ends_the_job(self):
+        job = self.store.submit("ab;", 50, {"system": "be brief", "thinking": True, "stop": [";"]})
+        self.worker.run_one()
+        self.assertEqual(self.runner.last, {"system": "be brief", "thinking": True})
+        done = self.store.get(job)
+        self.assertEqual((done["state"], done["output"], done["tokens"]), ("done", "ab", 3))
+
+    def test_delete_only_finished_jobs(self):
+        job = self.store.submit("a", 2)
+        self.assertFalse(self.store.delete(job))
+        self.worker.run_one()
+        self.assertTrue(self.store.delete(job))
+        self.assertIsNone(self.store.delete(job))
+
+
+class TestHttpApiV2(TestHttpApi):
+    def test_health(self):
+        health = json.loads(self.call("/health")[1])
+        self.assertEqual((health["status"], health["model"], health["jobs"]["queued"]), ("ok", "fake", 0))
+        self.assertGreater(health["free_ram_gb"], 0)
+
+    def test_options_are_validated(self):
+        for bad in ({"temperature": 3}, {"thinking": "yes"}, {"stop": ["a"] * 5}, {"system": 1}):
+            self.assertEqual(self.call("/jobs", dict(prompt="a", **bad))[0], 400, bad)
+        status, body = self.call("/jobs", {"prompt": "a", "stop": "x", "thinking": True})
+        self.assertEqual(status, 202)
+        options = self.store.get(json.loads(body)["id"])["options"]
+        self.assertEqual(options, {"temperature": 0.0, "thinking": True, "stop": ["x"]})
+
+    def test_filter_and_delete(self):
+        first = json.loads(self.call("/jobs", {"prompt": "a"})[1])["id"]
+        self.call(f"/jobs/{first}/cancel", {})
+        self.call("/jobs", {"prompt": "b"})
+        self.assertEqual([j["id"] for j in json.loads(self.call("/jobs?state=cancelled")[1])], [first])
+        self.assertEqual(self.call("/jobs?state=nope")[0], 400)
+        request = urllib.request.Request(f"{self.base}/jobs/{first}", method="DELETE")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+        self.assertEqual(self.call(f"/jobs/{first}")[0], 404)
+
+    def test_events_stream_until_the_job_finishes(self):
+        self.worker.start()
+        job = json.loads(self.call("/jobs", {"prompt": "ab", "max_new_tokens": 20})[1])["id"]
+        with urllib.request.urlopen(f"{self.base}/jobs/{job}/events", timeout=10) as response:
+            self.assertEqual(response.headers["Content-Type"], "text/event-stream")
+            events = [json.loads(line[6:]) for line in response.read().decode().splitlines()
+                      if line.startswith("data: ")]
+        self.assertEqual(events[-1]["state"], "done")
+        self.assertEqual(events[-1]["output"], "ab" * 10)
+
+
+class TestWebInterface(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        self.tmp = tempfile.TemporaryDirectory()
+        web = Path(self.tmp.name) / "web"
+        web.mkdir()
+        (web / "index.html").write_text("<title>Mull</title>")
+        (Path(self.tmp.name) / "secret.txt").write_text("private")
+        self.store = JobStore(":memory:")
+        self.server = make_server(self.store, Worker(self.store, FakeRunner()), port=0, web_root=web)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def test_index_is_served(self):
+        with urllib.request.urlopen(self.base + "/", timeout=5) as response:
+            self.assertIn("text/html", response.headers["Content-Type"])
+            self.assertIn(b"Mull", response.read())
+
+    def test_files_outside_the_folder_are_not_served(self):
+        for path in ("/../secret.txt", "/%2e%2e/secret.txt", "/missing.js"):
+            with self.assertRaises(urllib.error.HTTPError, msg=path) as caught:
+                urllib.request.urlopen(self.base + path, timeout=5)
+            self.assertEqual(caught.exception.code, 404)
+
+
+class TestRunnerChoice(unittest.TestCase):
+    def test_runner_matches_the_runtime(self):
+        from mull.server.worker import LlamaMlxRunner, PackedModelRunner, runner_for
+
+        packed = type("Packed", (), {"request_lock": None, "plan_request": None, "tokenizer": None})()
+        llama = type("Llama", (), {"model_generate": None, "tokenizer": None})()
+        self.assertIsInstance(runner_for(packed), PackedModelRunner)
+        self.assertIs(type(runner_for(llama)), LlamaMlxRunner)
+        self.assertIsNone(runner_for(object()))

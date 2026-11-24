@@ -119,6 +119,16 @@ def min_free_ram_bytes():
     return max(1024 ** 3, total // 10)
 
 
+AUTO_KEEP_FREE = 0.3  # memory_percent="auto" leaves this share of total RAM for everything else
+
+
+def auto_memory_budget(available, keep_free_fraction=AUTO_KEEP_FREE):
+    """memory_percent="auto": free RAM the model may use, leaving keep_free_fraction of total RAM
+    (and never less than min_free_ram_bytes()) for other programs."""
+    total, _available = system_ram_bytes()
+    return max(0, available - max(int(total * keep_free_fraction), min_free_ram_bytes()))
+
+
 def has_room_to_prefetch(nbytes):
     """Whether reading ``nbytes`` ahead of time keeps free RAM above min_free_ram_bytes().
 

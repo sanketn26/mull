@@ -2,7 +2,7 @@
 #
 #   make setup   install Python, the package (editable) and dev tools with uv (creates .venv)
 #   make run     generate tokens (MODEL=, PROMPT=, MAX_NEW_TOKENS=, COMPRESSION=4bit|8bit, MEMORY_PERCENT=)
-#   make serve   start the background job server (MODEL= a packed MLX checkpoint, PORT=8765)
+#   make serve   start the job server (MODEL= a packed MLX checkpoint, PORT=8765, WEB=1 for the web interface)
 #   make test    run the unit tests that work offline on this machine
 #   make lint    static checks (ruff)
 #   make clean   remove build and cache artifacts (add `make clean-all` to drop .venv too)
@@ -18,13 +18,14 @@ MAX_NEW_TOKENS ?= 20
 COMPRESSION    ?=
 MEMORY_PERCENT ?=
 PORT           ?= 8765
+WEB            ?=
 
 # Extras from pyproject.toml: the MLX runtime on macOS. Dev tools come from the default `dev` group.
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
-EXTRAS := --extra mac
+EXTRAS := --extra mac --extra mcp
 else
-EXTRAS :=
+EXTRAS := --extra mcp
 endif
 
 PYTEST_ARGS ?=
@@ -49,7 +50,7 @@ run:
 
 serve:
 	$(UV) run $(EXTRAS) python -m mull.server --model "$(MODEL)" --port $(PORT) \
-		$(if $(MEMORY_PERCENT),--memory-percent $(MEMORY_PERCENT))
+		$(if $(MEMORY_PERCENT),--memory-percent $(MEMORY_PERCENT)) $(if $(WEB),--web)
 
 test:
 	$(UV) run $(EXTRAS) pytest tests -q $(PYTEST_ARGS)

@@ -20,7 +20,7 @@ jobs:
         with:
           enable-cache: true
       - name: Install (uv sync from uv.lock)
-        run: uv sync --locked --extra mac
+        run: uv sync --locked --extra mac --extra mcp
       - name: Lint
         run: make lint
       - name: Test (offline, no model downloads)

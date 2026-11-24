@@ -1,0 +1,164 @@
+:root {
+  --bg: #f7f7f5;
+  --panel: #ffffff;
+  --text: #1d1d1b;
+  --muted: #6b6b66;
+  --border: #e2e1dc;
+  --accent: #3b5bdb;
+  --accent-text: #ffffff;
+  --error: #c92a2a;
+  --code: #f1f0ec;
+  --state-queued: #868e96;
+  --state-running: #1971c2;
+  --state-done: #2b8a3e;
+  --state-failed: #c92a2a;
+  --state-cancelled: #e67700;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161615;
+    --panel: #1f1f1d;
+    --text: #ecebe6;
+    --muted: #a3a29b;
+    --border: #34332f;
+    --accent: #748ffc;
+    --accent-text: #10121a;
+    --error: #ff8787;
+    --code: #262624;
+    --state-queued: #adb5bd;
+    --state-running: #74c0fc;
+    --state-done: #8ce99a;
+    --state-failed: #ff8787;
+    --state-cancelled: #ffc078;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, sans-serif;
+}
+
+header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+h1 { margin: 0; font-size: 20px; }
+h2 { margin: 0 0 12px; font-size: 16px; }
+h3 { margin: 16px 0 6px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+
+.health { color: var(--muted); font-size: 13px; }
+.health.down { color: var(--error); }
+
+main {
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) minmax(280px, 1fr);
+  gap: 16px;
+  padding: 16px 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.detail { grid-column: 1 / -1; }
+
+@media (max-width: 760px) {
+  main { grid-template-columns: 1fr; padding: 16px; }
+  header { padding: 12px 16px; }
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  min-width: 0;
+}
+
+.panel-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
+.panel-head h2 { margin: 0; }
+
+label { display: block; margin-bottom: 10px; font-size: 13px; color: var(--muted); }
+label.check { display: flex; gap: 8px; align-items: center; color: var(--text); }
+
+textarea, input, select {
+  width: 100%;
+  margin-top: 4px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
+input[type=checkbox] { width: auto; margin: 0; }
+select { width: auto; margin: 0; }
+
+.row { display: flex; gap: 12px; }
+.row label { flex: 1; }
+
+details { margin-bottom: 12px; }
+summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+
+.actions { display: flex; align-items: center; gap: 8px; }
+
+button {
+  padding: 8px 14px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font: inherit;
+  cursor: pointer;
+}
+
+button.secondary { background: transparent; color: var(--text); border-color: var(--border); }
+button:disabled { opacity: .5; cursor: default; }
+
+.error { color: var(--error); font-size: 13px; }
+.meta { color: var(--muted); font-size: 13px; margin: 0; }
+
+.jobs { list-style: none; margin: 0; padding: 0; max-height: 60vh; overflow-y: auto; }
+
+.jobs li {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.jobs li:hover, .jobs li.selected { background: var(--code); }
+.jobs .prompt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jobs .empty { color: var(--muted); cursor: default; display: block; }
+
+.state { font-size: 12px; font-weight: 600; }
+.state.queued { color: var(--state-queued); }
+.state.running { color: var(--state-running); }
+.state.done { color: var(--state-done); }
+.state.failed { color: var(--state-failed); }
+.state.cancelled { color: var(--state-cancelled); }
+
+pre {
+  margin: 0;
+  padding: 12px;
+  background: var(--code);
+  border-radius: 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  max-height: 50vh;
+  overflow-y: auto;
+}

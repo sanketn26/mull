@@ -9,7 +9,7 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
 from .checkpoint import find_or_create_local_splitted_path
-from .memory import collect_garbage
+from .memory import auto_memory_budget, collect_garbage
 from .mlx_llama import (  # noqa: F401  (ModelArgs, Attention, ... re-exported for existing imports)
     Attention, FeedForward, ModelArgs, RMSNorm, TransformerBlock, _coerce_to_mlx_array,
     get_model_args_from_config, sample, sanitize_config,
@@ -80,7 +80,8 @@ class AirLLMLlamaMlx:
         self.least_available = None
         self.initial_available = psutil.virtual_memory().available / 1024 / 1024
         self.max_seq_len = max_seq_len
-        self.memory_percent = validate_memory_percent(memory_percent)
+        self.adaptive = memory_percent == "auto"
+        self.memory_percent = 100.0 if self.adaptive else validate_memory_percent(memory_percent)
 
         self.persister = MlxModelPersister()
         self.model_local_path, self.checkpoint_path = find_or_create_local_splitted_path(
@@ -130,7 +131,12 @@ class AirLLMLlamaMlx:
         sizes = {i: self.persister.layer_file(name, self.checkpoint_path).stat().st_size
                  for i, name in enumerate(self.layer_names)}
         available = psutil.virtual_memory().available
-        budget = int(available * self.memory_percent / 100)
+        if self.adaptive:
+            # Planned once, at load: this runtime keeps the same plan for its whole life.
+            budget = auto_memory_budget(available)
+            self.memory_percent = round(100 * budget / available, 1) if available else 0.0
+        else:
+            budget = int(available * self.memory_percent / 100)
         a = self.model_args
         kv_cache = 2 * a.n_layers * a.n_kv_heads * a.head_dim * self.max_seq_len * 2
         plan = plan_sliding(sizes, budget, kv_cache_bytes=kv_cache, unified_memory=True,

@@ -19,6 +19,7 @@ from .checkpoint import safetensor_manifest
 from .mlx_experts import ExpertCache, StreamedExperts
 from .mlx_llama import _coerce_to_mlx_array, sample
 from .persist.mlx_model_persister import load_packed_weights, warm_packed_weights
+from .memory import AUTO_KEEP_FREE, auto_memory_budget
 from .prefetch import PrefetchWindow
 from .sliding import (
     DEFAULT_MEMORY_PERCENT, MAX_PREFETCH_WINDOW, minimum_execution_budget, plan_sliding, validate_memory_percent,
@@ -252,7 +253,8 @@ class AirLLMPackedMlx:
 
     def __init__(self, checkpoint, *, memory_percent=DEFAULT_MEMORY_PERCENT, test_nonlayered=False,
                  prefetching=True, revision=None, hf_token=None, compression=None,
-                 expert_streaming=False, expert_cache_bytes=256 << 20, **kwargs):
+                 expert_streaming=False, expert_cache_bytes=256 << 20, keep_free_fraction=AUTO_KEEP_FREE,
+                 **kwargs):
         if compression is not None or kwargs:
             raise ValueError(f"Unsupported native MLX options: {sorted(kwargs)} compression={compression!r}")
         path = Path(checkpoint)
@@ -280,7 +282,11 @@ class AirLLMPackedMlx:
         self.sizes = {i: sum(self.manifest[key][3] for key in self.keys[name])
                       for i, name in enumerate(self.names)}
         self.load_tokenizer()
-        self.memory_percent = validate_memory_percent(memory_percent)
+        self.adaptive = memory_percent == "auto"
+        if self.adaptive and not 0 <= keep_free_fraction < 1:
+            raise ValueError("keep_free_fraction must be in [0, 1)")
+        self.keep_free_fraction = keep_free_fraction
+        self.memory_percent = 100.0 if self.adaptive else validate_memory_percent(memory_percent)
         self.available = None          # set to override free RAM; otherwise measured per request
         self.request_available = None
         self.force_resident = test_nonlayered
@@ -349,9 +355,8 @@ class AirLLMPackedMlx:
         if self.force_resident:
             indices = self.sizes
         elif self.memory_percent:
-            available = self.available if self.available is not None else psutil.virtual_memory().available
+            available, budget = self.request_budget()
             self.request_available = available
-            budget = int(available * self.memory_percent / 100)
             expert_reserve = self.experts.reserve(prompt_length) if self.experts else 0
             inference = self.cache_bytes + self.workspace_bytes + expert_reserve
             self.plan = plan_sliding(self.sizes, budget, inference,
@@ -382,6 +387,24 @@ class AirLLMPackedMlx:
             self.prefetch_window = PrefetchWindow(streamed, self.warm_module, self.plan.window,
                                                   size_of=sizes.__getitem__, load_now=lambda _: None,
                                                   executor=self.executor)
+
+    def request_budget(self):
+        """Free RAM for this request and the share the model may use.
+
+        A fixed memory_percent takes that share of free RAM. "auto" uses free RAM down to
+        keep_free_fraction of total, so the model stays loaded when the machine is idle and
+        streams when it is busy. Its own resident weights count as free: they would be if released.
+        """
+        if self.available is not None:
+            available = self.available
+        else:
+            memory = psutil.virtual_memory()
+            available = memory.available
+            if self.adaptive:
+                available += sum(self.sizes[i] for i, name in enumerate(self.names) if name in self.resident)
+        if not self.adaptive:
+            return available, int(available * self.memory_percent / 100)
+        return available, auto_memory_budget(available, self.keep_free_fraction)
 
     def finish_request(self):
         if self.executor is not None:

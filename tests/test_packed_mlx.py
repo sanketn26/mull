@@ -198,6 +198,35 @@ def test_free_ram_is_measured_for_each_request(tmp_path, monkeypatch):
         assert model.plan.budget_bytes == free // 2
 
 
+def test_auto_memory_keeps_a_reserve_and_counts_its_own_weights(tmp_path, monkeypatch):
+    import psutil
+
+    import mull.memory as memory
+
+    path = tmp_path / "auto"
+    qwen35_fixture(path)
+    model = AutoModel.from_pretrained(path, memory_percent="auto", keep_free_fraction=0.25)
+    total = 16 << 30
+    monkeypatch.setattr(memory, "min_free_ram_bytes", lambda: 1 << 30)
+    monkeypatch.setattr(memory, "system_ram_bytes", lambda: (total, 0))
+    for free in (12 << 30, 3 << 30):
+        memory = type("M", (), {"available": free, "total": total})()
+        monkeypatch.setattr(psutil, "virtual_memory", lambda memory=memory: memory)
+        model.resident.clear()
+        model.generate(mx.array([[1]]), max_new_tokens=1)
+        assert model.plan.budget_bytes == max(0, free - total // 4)
+    model.resident = {name: None for name in model.names}
+    available, _ = model.request_budget()
+    assert available == (3 << 30) + sum(model.sizes.values())
+
+
+def test_auto_memory_is_rejected_with_a_bad_reserve(tmp_path):
+    path = tmp_path / "bad"
+    qwen35_fixture(path)
+    with pytest.raises(ValueError, match="keep_free_fraction"):
+        AutoModel.from_pretrained(path, memory_percent="auto", keep_free_fraction=1.5)
+
+
 def test_plain_checkpoint_error_names_the_mlx_format():
     from mull.airllm_packed_mlx import packed_configuration
 

@@ -101,17 +101,62 @@ Packed models generate decoded continuations for one request at a time. The requ
 Queue prompts over HTTP and let one worker run them on a loaded packed MLX model. Jobs are kept in SQLite, so they survive a restart: a job that was running when the server stopped is queued again.
 
 ```bash
-make serve MODEL=/path/to/Qwen3-8B-4bit      # http://127.0.0.1:8765/ shows a status page
-curl -X POST localhost:8765/jobs -d '{"prompt": "Explain this stack trace ...", "max_new_tokens": 512}'
-curl localhost:8765/jobs/1                    # state, tokens so far, output
-curl -X POST localhost:8765/jobs/1/cancel
+make serve MODEL=/path/to/Qwen3-8B-4bit          # API only, on http://127.0.0.1:8765
+make serve MODEL=/path/to/Qwen3-8B-4bit WEB=1    # also serve the web interface from web/
 ```
 
-Jobs run one at a time, in order. Output is saved as it is generated, and a cancelled job stops at its next token. A full queue returns 429. A job that needs more memory than is free fails with a message instead of pushing the machine into swap. The server listens on localhost only and has no authentication. Batching is next.
+| Method | Path | What it does |
+| --- | --- | --- |
+| `GET` | `/health` | Loaded model, memory share, job counts, free RAM |
+| `POST` | `/jobs` | Queue a job; returns `202 {"id": ...}`. 400 for bad input, 429 when the queue is full |
+| `GET` | `/jobs?state=&limit=` | Recent jobs, newest first |
+| `GET` | `/jobs/{id}` | State, tokens so far, `output`, `reasoning`, error, timings |
+| `GET` | `/jobs/{id}/events` | Server-sent events: the job each time it changes, until it finishes |
+| `POST` | `/jobs/{id}/cancel` | Cancel now if queued, at the next token if running |
+| `DELETE` | `/jobs/{id}` | Remove a finished job |
+
+`POST /jobs` fields:
+
+| Field | Default | |
+| --- | --- | --- |
+| `prompt` | required | |
+| `max_new_tokens` | 256 | Up to the server's limit (`--max-new-tokens-limit`, 4096) |
+| `system` | none | System prompt |
+| `thinking` | `false` | Let a reasoning model (Qwen3) think before answering. The thinking goes to `reasoning`, not `output` |
+| `temperature` | 0 | 0 to 2; 0 is greedy |
+| `stop` | none | Up to 4 strings; the answer ends before the first one |
+
+```bash
+curl -X POST localhost:8765/jobs -d '{"prompt": "Explain this stack trace ...", "max_new_tokens": 512}'
+curl localhost:8765/jobs/1
+```
+
+Thinking costs time. On Qwen3-8B-4bit, "What is 17 × 23?" took 3 tokens and 1.0 s with thinking off, and 523 tokens and 53.6 s with it on. Both answered 391.
+
+Jobs run one at a time, in order. The server uses `memory_percent="auto"` unless you pass `--memory-percent` (or `MEMORY_PERCENT=`). A job that needs more memory than is free fails with a message instead of pushing the machine into swap. The server listens on localhost only and has no authentication. The web interface in `web/` is plain HTML, CSS and JavaScript that uses only the API above; it is served only with `--web` (or `WEB=1`).
+
+### Use from Claude Code or Codex (MCP)
+
+`mull-mcp` is an MCP server that lets a coding agent hand slow or private work to Mull: summarising many files, overnight reviews, transcripts. The agent queues a job and checks back later; it can pass file paths, so large files don't go through its own context. Tools: `mull_submit`, `mull_result` (can wait up to 60 s), `mull_cancel`, `mull_list`.
+
+Start the job server (`make serve MODEL=...`), then register `mull-mcp` once. `make setup` installs it into `.venv`.
+
+```bash
+claude mcp add mull -- /path/to/mull/.venv/bin/mull-mcp     # Claude Code
+```
+
+```toml
+# Codex: ~/.codex/config.toml
+[mcp_servers.mull]
+command = "/path/to/mull/.venv/bin/mull-mcp"
+```
+
+Set `MULL_URL` if the job server isn't on `http://127.0.0.1:8765`. Mull is too slow to be the agent's main model; it is meant for work the agent can leave running.
 
 ## Options Mull adds or changes
 
 - **`memory_percent`** (default `25`; `0` turns it off): the share of free memory that sliding adaptive processing may use. On CUDA that memory is VRAM; on Apple silicon and CPU it is system RAM.
+- **`memory_percent="auto"`** (packed MLX models; the job server's default): use free RAM but always leave 30% of total for other apps (`keep_free_fraction=0.3`). The model stays fully loaded while the machine is idle and streams when it is busy. Its own resident weights count as free, so it doesn't shrink after the first request. On Qwen3-8B-4bit (200 tokens, two runs): 32.1 and 28.7 tok/s with `auto`, against 14.5 and 9.5 tok/s at 25%, for 4.7 GB of RAM instead of 3.1 GB.
 - **`compression`** (`'4bit'` or `'8bit'`): on macOS this uses MLX-native quantization. The quantized split is written once, to its own folder. On CUDA it uses bitsandbytes, as in AirLLM.
 
 For the layer-splitting backend, other options are described in [AirLLM's documentation](https://github.com/lyogavin/airllm#configurations).
