@@ -193,6 +193,11 @@ Budget 8.15GB (50% of 16.30GB free); 6.18GB resident, 23.56GB read per token mos
 
 Read-ahead never pushes free RAM below `max(1 GB, 10% of total)`. Override that floor with `MULL_MIN_FREE_RAM_GB`.
 
+Two refinements on packed MLX models:
+
+- **First load reads ahead.** On the first request, a background thread reads the files of the layers that will stay resident, in the order they run, while earlier layers are set up. It needs no extra memory, since those layers are planned to stay loaded. Qwen3-8B-4bit read cold from a USB drive: first token in 10.0 and 9.8 s, against 12.4 and 12.7 s without it.
+- **Untied embeddings are read by row.** A token needs one row (a few KB) of an input table that can be hundreds of MB. When the output layer has its own weights, Mull reads just the prompt's rows, so the planner spends that RAM on decoder layers instead, which every token reads in full. The table stays in RAM only when everything else already fits. Qwen3-8B-4bit at 25% of 12 GB (512-token prompt, 64 tokens, three runs each): 9.99 / 9.96 / 9.94 tok/s before, 11.36 / 11.27 / 11.27 after, with identical tokens. Fully loaded is unchanged (about 32 tok/s).
+
 ### MLX compression
 
 Measured with TinyLlama-1.1B on Apple silicon:

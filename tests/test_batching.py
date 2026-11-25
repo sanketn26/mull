@@ -16,17 +16,19 @@ from mull.server.batch import NoRoom, PackedBatch  # noqa: E402
 from mull.server.runners import PackedModelRunner  # noqa: E402
 from mull.server.store import JobStore  # noqa: E402
 from mull.server.worker import Worker  # noqa: E402
-from tests.test_packed_mlx import qwen3_fixture, qwen35_fixture  # noqa: E402
+from tests.test_packed_mlx import llama_fixture, qwen3_fixture, qwen35_fixture  # noqa: E402
 
 PROMPTS = [[5, 9, 14, 3, 27, 8, 11, 40, 2, 7], [12, 4], [30, 31, 32, 33, 34, 35]]
 STEPS = 10
 
 
-@pytest.fixture(params=["qwen3", "qwen35"])
+@pytest.fixture(params=["qwen3", "qwen35", "llama"])
 def model(request, tmp_path):
     path = tmp_path / request.param
     if request.param == "qwen3":
         qwen3_fixture(path, tied=False, seed=3)
+    elif request.param == "llama":
+        llama_fixture(path)
     else:
         qwen35_fixture(path)
     return AutoModel.from_pretrained(path, memory_percent=50)

@@ -72,7 +72,10 @@ class AutoModel:
             )
             architectures = config.get("architectures") or [""]
             arch = architectures[0]
-            if arch in PACKED_MLX_ARCHITECTURES:
+            # Pre-quantized MLX Llama/Mistral checkpoints use the packed runtime (batching, prefix cache);
+            # plain Hugging Face weights stay on the Llama runtime, which can compress them while loading.
+            prequantized = arch in MLX_ARCHITECTURES and config.get("quantization", {}).get("bits") == 4
+            if arch in PACKED_MLX_ARCHITECTURES or prequantized:
                 try:
                     from .airllm_packed_mlx import AirLLMPackedMlx
                 except ModuleNotFoundError as error:

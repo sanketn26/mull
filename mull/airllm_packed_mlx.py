@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import psutil
 from huggingface_hub import hf_hub_download, snapshot_download
-from mlx_lm.models import gpt_oss, qwen3, qwen3_5, qwen3_moe
+from mlx_lm.models import gpt_oss, llama, qwen3, qwen3_5, qwen3_moe
 from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 from mlx_lm.utils import load_tokenizer
@@ -73,6 +73,27 @@ class Qwen3Decoder(Decoder):
 
     def build_block(self, args, name):
         return qwen3.TransformerBlock(args)
+
+
+class LlamaDecoder(Decoder):
+    """Llama and Mistral (mlx-lm runs Mistral as Llama), full attention in every layer."""
+
+    def __init__(self, config):
+        if config.get("model_type") not in ("llama", "mistral"):
+            raise ValueError("Expected a Llama or Mistral configuration")
+        self.args = a = llama.ModelArgs.from_dict(config)
+        if any(kind != "full_attention" for kind in a.layer_types):
+            raise ValueError("Llama/Mistral with sliding-window layers is not supported by the packed runtime")
+        if a.head_dim is None:
+            a.head_dim = a.hidden_size // a.num_attention_heads
+        self.layers = [f"model.layers.{i}" for i in range(a.num_hidden_layers)]
+        self.tied = a.tie_word_embeddings
+
+    def source_key(self, key):
+        return None if "rotary_emb.inv_freq" in key else key
+
+    def build_block(self, args, name):
+        return llama.TransformerBlock(args)
 
 
 class Qwen35Decoder(Decoder):
@@ -229,7 +250,7 @@ class Qwen3MoeDecoder(Decoder):
         return cache, workspace + experts * self.activation_bytes
 
 
-DECODERS = {"qwen3": Qwen3Decoder, "qwen3_5": Qwen35Decoder, "gpt_oss": GptOssDecoder,
+DECODERS = {"llama": LlamaDecoder, "mistral": LlamaDecoder, "qwen3": Qwen3Decoder, "qwen3_5": Qwen35Decoder, "gpt_oss": GptOssDecoder,
             "qwen3_moe": Qwen3MoeDecoder}
 
 

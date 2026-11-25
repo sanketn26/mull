@@ -44,6 +44,49 @@ def qwen3_fixture(path, tied, seed):
     PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="0", eos_token="63").save_pretrained(path)
 
 
+def llama_fixture(path, tied=False, seed=5, model_type="llama"):
+    """Tiny 4-bit Llama (or Mistral) in mlx-community layout: grouped-query attention, Llama 3 RoPE scaling."""
+    from mlx_lm.models import llama
+
+    path.mkdir()
+    config = dict(architectures=["MistralForCausalLM" if model_type == "mistral" else "LlamaForCausalLM"],
+                  model_type=model_type, hidden_size=64, intermediate_size=128,
+                  num_attention_heads=4, num_key_value_heads=1, num_hidden_layers=2,
+                  rms_norm_eps=1e-5, vocab_size=64, max_position_embeddings=256, rope_theta=500000,
+                  rope_scaling=dict(rope_type="llama3", factor=8.0, low_freq_factor=1.0,
+                                    high_freq_factor=4.0, original_max_position_embeddings=64),
+                  tie_word_embeddings=tied, eos_token_id=63, quantization=dict(bits=4, group_size=32))
+    mx.random.seed(seed)
+    model = llama.Model(llama.ModelArgs.from_dict(config))
+    nn.quantize(model, bits=4, group_size=32,
+                class_predicate=lambda _, module: hasattr(module, "to_quantized")
+                and module.weight.shape[-1] % 32 == 0)
+    mx.save_safetensors(str(path / "model.safetensors"), dict(tree_flatten(model.parameters())))
+    (path / "config.json").write_text(json.dumps(config))
+    vocab = {str(i): i for i in range(64)}
+    tokenizer = Tokenizer(WordLevel(vocab, unk_token="0"))
+    PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="0", eos_token="63").save_pretrained(path)
+
+
+@pytest.mark.parametrize("model_type,tied", [("llama", False), ("llama", True), ("mistral", False)])
+def test_llama_runs_on_packed_runtime(tmp_path, model_type, tied):
+    from mull.airllm_packed_mlx import AirLLMPackedMlx
+
+    path = tmp_path / model_type
+    llama_fixture(path, tied=tied, model_type=model_type)
+    ref, _ = load_model(path)
+    steps = [mx.array([[1, 2, 3, 4, 5]]), *(mx.array([[i]]) for i in range(6, 14))]
+    for percent, resident in ((0, False), (100, False), (0, True)):
+        model = AutoModel.from_pretrained(path, memory_percent=percent, test_nonlayered=resident)
+        assert isinstance(model, AirLLMPackedMlx)
+        model.plan_request(5, 9)
+        cache, ref_cache = model.decoder.make_cache(), make_prompt_cache(ref)
+        for tokens in steps:
+            expected = ref(tokens, cache=ref_cache)[:, -1]
+            assert mx.allclose(model.last_logits(tokens, cache), expected, atol=1e-5, rtol=1e-5).item()
+        model.finish_request()
+
+
 @pytest.mark.parametrize("tied", [False, True])
 def test_qwen3_native_checkpoint(tmp_path, tied):
     path = tmp_path / "source"
