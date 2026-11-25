@@ -25,7 +25,8 @@ async function refreshHealth() {
   const box = $("health");
   try {
     const h = await api("/health");
-    const running = h.running_job ? `running #${h.running_job}` : "idle";
+    const ids = h.running_jobs || (h.running_job ? [h.running_job] : []);
+    const running = ids.length ? `running ${ids.map((id) => `#${id}`).join(", ")} (batch up to ${h.max_batch})` : "idle";
     box.textContent = `${h.model || "model"} · ${running} · ${h.jobs.queued} queued · ` +
       `${h.free_ram_gb} of ${h.total_ram_gb} GB RAM free`;
     box.classList.remove("down");

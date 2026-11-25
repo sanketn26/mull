@@ -19,6 +19,8 @@ COMPRESSION    ?=
 MEMORY_PERCENT ?=
 PORT           ?= 8765
 WEB            ?=
+KEEP_FREE      ?=
+MAX_BATCH      ?=
 
 # Extras from pyproject.toml: the MLX runtime on macOS. Dev tools come from the default `dev` group.
 UNAME_S := $(shell uname -s)
@@ -50,7 +52,9 @@ run:
 
 serve:
 	$(UV) run $(EXTRAS) python -m mull.server --model "$(MODEL)" --port $(PORT) \
-		$(if $(MEMORY_PERCENT),--memory-percent $(MEMORY_PERCENT)) $(if $(WEB),--web)
+		$(if $(MEMORY_PERCENT),--memory-percent $(MEMORY_PERCENT)) $(if $(WEB),--web) \
+		$(if $(KEEP_FREE),--keep-free-percent $(KEEP_FREE)) \
+		$(if $(MAX_BATCH),--max-batch $(MAX_BATCH))
 
 test:
 	$(UV) run $(EXTRAS) pytest tests -q $(PYTEST_ARGS)

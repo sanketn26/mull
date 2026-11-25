@@ -80,7 +80,7 @@ class ExpertCache:
     def apply(self, layer, x, indices):
         model = self.model
         a = model.decoder.args
-        if self.use_whole_layer(x.shape[1]):
+        if self.use_whole_layer(x.shape[0] * x.shape[1]):  # every row's tokens, as reserve() assumes
             weights = model.read_weights(self.keys[layer])
             count = a.num_experts
         else:

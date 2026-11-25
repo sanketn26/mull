@@ -22,10 +22,15 @@ CREATE TABLE IF NOT EXISTS jobs (
     cancel_requested INTEGER NOT NULL DEFAULT 0,
     created REAL NOT NULL,
     started REAL,
+    first_token REAL,
     finished REAL,
     updated REAL NOT NULL DEFAULT 0
 )
 """
+
+
+# Columns added after the first release; older databases get them on open.
+_ADDED_COLUMNS = {"first_token": "REAL"}
 
 
 class QueueFull(Exception):
@@ -51,6 +56,10 @@ class JobStore:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute(_SCHEMA)
+        present = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
+        for column, kind in _ADDED_COLUMNS.items():
+            if column not in present:
+                self.db.execute(f"ALTER TABLE jobs ADD COLUMN {column} {kind}")
 
     def _run(self, sql, args=()):
         with self.lock:
@@ -77,9 +86,17 @@ class JobStore:
             self.db.execute("UPDATE jobs SET state='running', started=?, updated=? WHERE id=?", (now, now, row["id"]))
             return dict(_job(row), state="running")
 
+    def requeue(self, job_id):
+        """Put a claimed job back at the front of the queue (it didn't fit in the running batch)."""
+        self._run("UPDATE jobs SET state='queued', started=NULL, updated=? WHERE id=? AND state='running'",
+                  (time.time(), job_id))
+
     def progress(self, job_id, output, tokens, reasoning=""):
         self._run("UPDATE jobs SET output=?, reasoning=?, tokens=?, updated=? WHERE id=?",
                   (output, reasoning, tokens, time.time(), job_id))
+
+    def first_token(self, job_id):
+        self._run("UPDATE jobs SET first_token=? WHERE id=?", (time.time(), job_id))
 
     def finish(self, job_id, state, error=None):
         assert state in FINISHED, state
@@ -117,7 +134,7 @@ class JobStore:
 
     def requeue_interrupted(self):
         """After a restart, jobs left running never finished: queue them again from the start."""
-        cursor = self._run("UPDATE jobs SET state='queued', output='', reasoning='', tokens=0, started=NULL, "
+        cursor = self._run("UPDATE jobs SET state='queued', output='', reasoning='', tokens=0, started=NULL, first_token=NULL, "
                            "cancel_requested=0, updated=? WHERE state='running'", (time.time(),))
         return cursor.rowcount
 

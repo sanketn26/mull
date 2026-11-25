@@ -9,7 +9,7 @@ from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
 
 from .checkpoint import find_or_create_local_splitted_path
-from .memory import auto_memory_budget, collect_garbage
+from .memory import AUTO_KEEP_FREE, auto_memory_budget, collect_garbage
 from .mlx_llama import (  # noqa: F401  (ModelArgs, Attention, ... re-exported for existing imports)
     Attention, FeedForward, ModelArgs, RMSNorm, TransformerBlock, _coerce_to_mlx_array,
     get_model_args_from_config, sample, sanitize_config,
@@ -67,7 +67,7 @@ class AirLLMLlamaMlx:
     def __init__(self, model_local_path_or_repo_id, device="cuda:0", dtype=None, max_seq_len=512,
                  layer_shards_saving_path=None, profiling_mode=False, compression=None,
                  hf_token=None, prefetching=True, test_nonlayered=False, show_memory_util=False,
-                 delete_original=False, memory_percent=DEFAULT_MEMORY_PERCENT):
+                 delete_original=False, memory_percent=DEFAULT_MEMORY_PERCENT, keep_free_fraction=AUTO_KEEP_FREE):
         """See the class docstring for the parameters."""
         if compression is not None and compression not in QUANT_BITS:
             raise ValueError(f"compression must be one of {sorted(QUANT_BITS)} or None, got {compression!r}")
@@ -81,6 +81,9 @@ class AirLLMLlamaMlx:
         self.initial_available = psutil.virtual_memory().available / 1024 / 1024
         self.max_seq_len = max_seq_len
         self.adaptive = memory_percent == "auto"
+        if self.adaptive and not 0 <= keep_free_fraction < 1:
+            raise ValueError("keep_free_fraction must be in [0, 1)")
+        self.keep_free_fraction = keep_free_fraction
         self.memory_percent = 100.0 if self.adaptive else validate_memory_percent(memory_percent)
 
         self.persister = MlxModelPersister()
@@ -133,7 +136,7 @@ class AirLLMLlamaMlx:
         available = psutil.virtual_memory().available
         if self.adaptive:
             # Planned once, at load: this runtime keeps the same plan for its whole life.
-            budget = auto_memory_budget(available)
+            budget = auto_memory_budget(available, self.keep_free_fraction)
             self.memory_percent = round(100 * budget / available, 1) if available else 0.0
         else:
             budget = int(available * self.memory_percent / 100)

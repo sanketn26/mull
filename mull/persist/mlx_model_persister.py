@@ -153,6 +153,35 @@ def warm_packed_weights(path, manifest, keys):
                     size -= count
 
 
+def load_row_matrix(path, manifest, key, rows):
+    """Read the given rows of one tensor (sorted, unique) into a single array, coalescing adjacent rows."""
+    from itertools import groupby
+
+    import numpy as np
+
+    filename, dtype, shape, size, offset = manifest[key]
+    if rows and (rows[0] < 0 or rows[-1] >= shape[0]):
+        raise IndexError(f"Rows {rows[0]}..{rows[-1]} out of range for {key} with {shape[0]} rows")
+    row_bytes = size // shape[0]
+    data = bytearray(row_bytes * len(rows))
+    view = memoryview(data)
+    done = 0
+    with (path / filename).open("rb", buffering=0) as shard:
+        for _, group in groupby(enumerate(rows), lambda item: item[1] - item[0]):
+            group = [row for _, row in group]
+            want = row_bytes * len(group)
+            shard.seek(offset + row_bytes * group[0])
+            while want:
+                count = shard.readinto(view[done:done + want])
+                if not count:
+                    raise EOFError(f"Incomplete tensor range for {key}")
+                done += count
+                want -= count
+    dtypes = {"U32": "<u4", "U8": "u1", "BF16": "<u2", "F16": "<f2", "F32": "<f4"}
+    array = mx.array(np.frombuffer(data, dtype=dtypes[dtype]).reshape(len(rows), *shape[1:]))
+    return array.view(mx.bfloat16) if dtype == "BF16" else array
+
+
 def load_packed_rows(path, manifest, keys, rows):
     """Load sorted expert rows while keeping their packed bits and coalescing adjacent reads."""
     from itertools import groupby

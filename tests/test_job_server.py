@@ -95,6 +95,26 @@ class TestJobStoreFile(unittest.TestCase):
             self.assertEqual(JobStore(path).get(job)["prompt"], "kept")
 
 
+class TestStoreMigration(unittest.TestCase):
+    def test_older_database_gains_new_columns(self):
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+
+        from mull.server import store as store_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.sqlite3"
+            old = sqlite3.connect(path)
+            old.execute(store_module._SCHEMA.replace("    first_token REAL,\n", ""))
+            old.close()
+            store = JobStore(path)
+            job = store.submit("a", 2)
+            store.claim_next()
+            store.first_token(job)
+            self.assertIsNotNone(store.get(job)["first_token"])
+
+
 class TestWorker(unittest.TestCase):
     def setUp(self):
         self.store = JobStore(":memory:")

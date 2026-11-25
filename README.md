@@ -133,6 +133,18 @@ curl localhost:8765/jobs/1
 
 Thinking costs time. On Qwen3-8B-4bit, "What is 17 × 23?" took 3 tokens and 1.0 s with thinking off, and 523 tokens and 53.6 s with it on. Both answered 391.
 
+**Batching.** On packed models, up to `--max-batch` queued jobs (default 4) run together: each prompt is processed on its own, then every generation step reads the weights once for all of them. Jobs join and leave the batch as they arrive and finish. A job that doesn't fit in memory next to the running ones waits in the queue instead of failing. Measured on Qwen3-8B-4bit, four 128-token jobs queued at once:
+
+| | batch 1 | batch 2 | batch 4 |
+| --- | --- | --- | --- |
+| Fully loaded: total throughput | 29.9 tok/s | 57.8 tok/s | **108.8 tok/s** |
+| Fully loaded: wait for the last job's first token | 13.1 s | 4.8 s | 0.5 s |
+| Streamed (`--memory-percent 0`): total throughput | 4.5 tok/s | 8.4 tok/s | **15.1 tok/s** |
+
+Batched answers are valid but not always identical to running each job alone. Batched and single-row GPU kernels round differently in bf16 (logits differed by up to 0.375 here), which can flip a choice between two nearly tied tokens: in one job, "dictionary" instead of "hash" at token 11. Use `--max-batch 1` when you need runs to be reproducible. The Llama runtime (TinyLlama, Llama, Mistral) runs one job at a time.
+
+**Prefix cache.** Jobs that start with the same text (a shared system prompt, the same files followed by a different question) reuse the already-processed part of the prompt. On Qwen3-8B-4bit with a 4,200-token source file and three different questions, the time to the first token fell from about 4 s to 0.41–0.50 s for the second and third jobs, with identical answers. The cache holds up to 1 GB by default (`--prefix-cache-gb`, `0` turns it off), evicts the least recently used prompt first, and the memory planner counts what it holds. It is used with packed models (Qwen3, Qwen3.5, gpt-oss, Qwen3 MoE). Qwen3.5's state-space layers can't be rewound, so for Qwen3.5 only a prompt that fully extends an earlier one is reused.
+
 Jobs run one at a time, in order. The server uses `memory_percent="auto"` unless you pass `--memory-percent` (or `MEMORY_PERCENT=`). A job that needs more memory than is free fails with a message instead of pushing the machine into swap. The server listens on localhost only and has no authentication. The web interface in `web/` is plain HTML, CSS and JavaScript that uses only the API above; it is served only with `--web` (or `WEB=1`).
 
 ### Use from Claude Code or Codex (MCP)

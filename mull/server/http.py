@@ -38,6 +38,7 @@ class Api:
         memory = psutil.virtual_memory()
         info = getattr(self.worker.runner, "describe", dict)()
         return dict(info, status="ok", jobs=self.store.counts(), running_job=self.worker.current,
+                    running_jobs=getattr(self.worker, "running", []), max_batch=self.worker.batch.max_batch,
                     free_ram_gb=round(memory.available / 2**30, 2), total_ram_gb=round(memory.total / 2**30, 2))
 
     def list_jobs(self, query):

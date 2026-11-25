@@ -170,11 +170,13 @@ def test_qwen35_request_replans_and_evicts(tmp_path):
     path = tmp_path / "mixed"
     qwen35_fixture(path)
     model = AutoModel.from_pretrained(path, memory_percent=100)
-    model.available = all_resident_budget(model.sizes, sum(model.decoder.request_memory(1, 1)))
+    planned = model.planned_sizes()    # the untied embedding is read by rows, never resident
+    model.available = all_resident_budget(planned, sum(model.decoder.request_memory(1, 1))
+                                          + model.embed_lookup_bytes(1))
     model.generate(mx.array([[1]]), max_new_tokens=1)
-    assert len(model.resident) == len(model.names)
+    assert len(model.resident) == len(planned) == len(model.names) - 1
     model.generate(mx.ones((1, 16), dtype=mx.int32), max_new_tokens=1)
-    assert len(model.resident) < len(model.names)
+    assert len(model.resident) < len(planned)
     minimum = minimum_execution_budget(model.sizes, sum(model.decoder.request_memory(1, 1)))
     model.memory_percent = 1
     model.available = minimum * 2      # 1% is below the minimum, but free RAM can hold it
@@ -357,3 +359,100 @@ def test_packed_budget_reports_smallest_feasible_allocation():
     assert plan_sliding(sizes, minimum).resident == [0]
     fallback = plan_sliding(sizes, minimum - 1)
     assert fallback.reserve_bytes > fallback.budget_bytes
+
+
+def test_fallback_note_names_the_setting_to_change(tmp_path):
+    path = tmp_path / "note"
+    qwen35_fixture(path)
+    auto = AutoModel.from_pretrained(path, memory_percent="auto", keep_free_fraction=0.3)
+    note = auto.below_minimum_note(2 << 30, 3 << 30)
+    assert "memory_percent=auto" in note and "30%" in note and "--keep-free-percent" in note
+    fixed = AutoModel.from_pretrained(path, memory_percent=10)
+    assert "raise memory_percent" in fixed.below_minimum_note(1 << 30, 3 << 30)
+
+
+def test_first_pass_reads_resident_modules_ahead_in_order(tmp_path, monkeypatch):
+    path = tmp_path / "qwen3"
+    qwen3_fixture(path, tied=False, seed=3)
+    model = AutoModel.from_pretrained(path, memory_percent=50)
+    warmed = []
+    original = model.warm_module
+    monkeypatch.setattr(model, "warm_module", lambda name: (warmed.append(name), original(name)))
+    expected = model.generate_tokens(mx.array([[5, 9, 14]]), 0, 3)
+    assert model.resident_names and set(warmed) == model.resident_names and warmed == [n for n in model.names if n in warmed]
+    assert model.first_load == {} and model.first_load_executor is None
+    warmed.clear()
+    assert model.generate_tokens(mx.array([[5, 9, 14]]), 0, 3) == expected
+    assert warmed == []                                # already loaded: nothing read ahead again
+
+
+@pytest.mark.parametrize("fixture", ["qwen3", "qwen35"])
+def test_untied_embedding_reads_only_needed_rows(tmp_path, fixture):
+    path = tmp_path / fixture
+    qwen3_fixture(path, tied=False, seed=3) if fixture == "qwen3" else qwen35_fixture(path)
+    model = AutoModel.from_pretrained(path, memory_percent=50)
+    if model.decoder.tied:
+        pytest.skip("fixture ties its embeddings")
+    tokens = mx.array([[5, 9, 5, 14], [3, 3, 40, 2]])     # repeats and two rows
+    module = model.load_module(model.decoder.embed)
+    assert mx.array_equal(model.embed_rows(tokens), module(tokens))
+
+
+def test_tied_embedding_keeps_the_module_path(tmp_path):
+    path = tmp_path / "tied"
+    qwen3_fixture(path, tied=True, seed=3)
+    model = AutoModel.from_pretrained(path, memory_percent=50)
+    assert not model.embed_by_rows and model.embed_lookup_bytes(10) == 0
+
+
+def test_untied_embedding_resident_only_with_spare_budget(tmp_path):
+    from mull.sliding import all_resident_budget
+
+    path = tmp_path / "qwen3"
+    qwen3_fixture(path, tied=False, seed=3)
+    model = AutoModel.from_pretrained(path, memory_percent=100)
+    expected = model.generate_tokens(mx.array([[5, 9, 14]]), 0, 4)
+    inference = sum(model.decoder.request_memory(3, 4)) + model.embed_lookup_bytes(3)
+    model.available = all_resident_budget(model.planned_sizes(), inference)   # just the rest fits
+    assert model.generate_tokens(mx.array([[5, 9, 14]]), 0, 4) == expected
+    assert model.decoder.embed not in model.resident_names and model.embed_from_rows
+    model.available = 10 * all_resident_budget(model.sizes, inference)        # plenty of room
+    assert model.generate_tokens(mx.array([[5, 9, 14]]), 0, 4) == expected
+    assert model.decoder.embed in model.resident and not model.embed_from_rows
+
+
+def test_moe_reserve_covers_batched_decode(tmp_path):
+    path = tmp_path / "moe"
+    qwen3_moe_fixture(path)
+    model = AutoModel.from_pretrained(path, memory_percent=100, expert_streaming=True, expert_cache_bytes=64_000)
+    seen = []
+    original = model.experts.reserve
+    model.experts.reserve = lambda length: (seen.append(length), original(length))[1]
+    experts = model.experts
+    assert not experts.use_whole_layer(2) and experts.use_whole_layer(4)   # phases on opposite sides
+    assert experts.reserve(2) > experts.reserve(4)                         # reserve() is not monotonic
+    model.batch_rows = 4
+    model.plan_request(2, 4)                              # two-token prefill, then four decode rows
+    model.finish_request()
+    assert {2, 4} <= set(seen)                            # both phases were sized
+    plain = model.plan.reserve_bytes
+    model.batch_rows = 1
+    model.experts.reserve = original
+    model.plan_request(2, 4)                              # the prefill alone sets the larger reserve
+    model.finish_request()
+    assert model.plan.reserve_bytes == plain
+
+
+def test_embedding_rows_reject_out_of_range_ids(tmp_path):
+    from mull.persist.mlx_model_persister import load_row_matrix
+
+    path = tmp_path / "qwen3"
+    qwen3_fixture(path, tied=False, seed=3)
+    model = AutoModel.from_pretrained(path, memory_percent=0)
+    vocabulary = model.manifest[model.decoder.embed + ".weight"][2][0]
+    for bad in (vocabulary, -1):
+        with pytest.raises(ValueError, match="Token IDs"):
+            model.embed_rows(mx.array([[1, bad]]))
+    key = model.source_keys[model.decoder.embed + ".weight"]
+    with pytest.raises(IndexError):
+        load_row_matrix(model.path, model.source_manifest, key, [0, vocabulary])

@@ -18,7 +18,7 @@ from mlx_lm.utils import load_tokenizer
 from .checkpoint import safetensor_manifest
 from .mlx_experts import ExpertCache, StreamedExperts
 from .mlx_llama import _coerce_to_mlx_array, sample
-from .persist.mlx_model_persister import load_packed_weights, warm_packed_weights
+from .persist.mlx_model_persister import load_packed_weights, load_row_matrix, warm_packed_weights
 from .memory import AUTO_KEEP_FREE, auto_memory_budget
 from .prefetch import PrefetchWindow
 from .sliding import (
@@ -293,10 +293,14 @@ class AirLLMPackedMlx:
         self.prefetching = prefetching
         self.prefetch_window = None
         self.executor = None
+        self.first_load_executor = None
+        self.first_load = {}           # resident module name -> pending read-ahead of its bytes
         self.request_lock = Lock()
         self.resident = {}
         self.resident_names = set()
         self.weight_bytes_loaded = 0
+        self.reserved_bytes = 0        # held outside the plan, e.g. by a prefix cache
+        self.batch_rows = 1            # sequences decoded together (set by the server's batch)
 
     def inspect_weights(self):
         decoder = self.decoder
@@ -357,36 +361,131 @@ class AirLLMPackedMlx:
         elif self.memory_percent:
             available, budget = self.request_budget()
             self.request_available = available
-            expert_reserve = self.experts.reserve(prompt_length) if self.experts else 0
-            inference = self.cache_bytes + self.workspace_bytes + expert_reserve
-            self.plan = plan_sliding(self.sizes, budget, inference,
+            # Prefill routes the prompt; a batched decode step routes one token per row. reserve() is not
+            # monotonic (sparse reads can cost more than loading the whole layer), so take the larger.
+            expert_reserve = (max(self.experts.reserve(prompt_length), self.experts.reserve(self.batch_rows))
+                              if self.experts else 0)
+            inference = (self.cache_bytes + self.workspace_bytes + expert_reserve + self.reserved_bytes
+                         + self.embed_lookup_bytes(prompt_length))
+            sizes = self.planned_sizes()
+            self.plan = plan_sliding(sizes, budget, inference,
                                      max_window=MAX_PREFETCH_WINDOW if self.prefetching else 0,
                                      free_ram_bytes=available, prefetch_cached_layers=False)
             indices = self.plan.resident
             if self.plan.reserve_bytes > budget:
                 # The floor is one module at a time (as in the Llama runtime), never a refusal.
-                minimum = minimum_execution_budget(self.sizes, inference)
+                minimum = minimum_execution_budget(sizes, inference)
                 if minimum > available:
                     # Hardware safety outranks the floor: even one module would not fit in free RAM.
                     raise MemoryError(f"Estimated minimum model memory is {minimum} bytes; "
                                       f"only {available} bytes of RAM are free")
-                print(f"memory_percent={self.memory_percent:g} gives {budget / 2**30:.2f} GiB, below the "
-                      f"estimated {minimum / 2**30:.2f} GiB minimum: streaming one module at a time.")
+                print(self.below_minimum_note(budget, minimum))
         else:
             indices = ()
         self.resident_names = {self.names[i] for i in indices}
+        if self.room_for_whole_embedding():
+            self.resident_names.add(self.decoder.embed)
         evicted = self.resident.keys() - self.resident_names
         for name in evicted:
             del self.resident[name]
         if evicted:
             mx.clear_cache()
         if self.plan and self.plan.window:
-            streamed = [name for name in self.names if name not in self.resident_names]
+            streamed = [name for name in self.names
+                        if name not in self.resident_names and not self.embeds_by_rows(name)]
             sizes = dict(zip(self.names, self.sizes.values()))
             self.executor = ThreadPoolExecutor(max_workers=self.plan.window)
             self.prefetch_window = PrefetchWindow(streamed, self.warm_module, self.plan.window,
                                                   size_of=sizes.__getitem__, load_now=lambda _: None,
                                                   executor=self.executor)
+        self.start_first_load()
+
+    @property
+    def embed_by_rows(self):
+        """Untied input embeddings are read row by row (only the prompt's tokens), never loaded whole.
+
+        A token needs one row (a few KB) of a table that is hundreds of MB, and nothing else reads the
+        table when the output projection has its own weights. So the planner leaves it out of residency
+        and spends that RAM on decoder layers, which every token reads in full.
+        """
+        return not self.decoder.tied and not self.force_resident
+
+    def embeds_by_rows(self, name):
+        return name == self.decoder.embed and self.embed_by_rows
+
+    def room_for_whole_embedding(self):
+        """Keep the untied embedding in RAM only as a last use of spare budget: everything else is resident."""
+        plan = self.plan
+        if not (self.embed_by_rows and plan and plan.strategy == "all-resident"):
+            return False
+        embed = self.sizes[self.names.index(self.decoder.embed)]
+        return plan.resident_bytes + plan.reserve_bytes + embed <= plan.budget_bytes
+
+    @property
+    def embed_from_rows(self):
+        return self.embed_by_rows and self.decoder.embed not in self.resident_names
+
+    def planned_sizes(self):
+        return {i: size for i, size in self.sizes.items() if not self.embeds_by_rows(self.names[i])}
+
+    def embed_lookup_bytes(self, prompt_length):
+        """RAM to read the prompt's embedding rows: the packed bytes plus their MLX copy."""
+        if not self.embed_by_rows:
+            return 0
+        row = sum(self.manifest[key][3] // self.manifest[key][2][0] for key in self.keys[self.decoder.embed])
+        return 2 * row * prompt_length
+
+    def embed_rows(self, tokens):
+        """Embed ``tokens`` by reading and dequantizing only their rows of the table."""
+        flat = tokens.reshape(-1).tolist()
+        rows = sorted(set(flat))
+        vocabulary = self.manifest[self.decoder.embed + ".weight"][2][0]
+        if rows[0] < 0 or rows[-1] >= vocabulary:
+            raise ValueError(f"Token IDs must be in [0, {vocabulary}); got {rows[0]}..{rows[-1]}")
+        prefix = self.decoder.embed + "."
+        sources = {key[len(prefix):]: self.source_keys[key] for key in self.keys[self.decoder.embed]}
+        parts = {name: load_row_matrix(self.path, self.source_manifest, key, rows) for name, key in sources.items()}
+        self.weight_bytes_loaded += sum(part.nbytes for part in parts.values())
+        table = parts["weight"]
+        if "scales" in parts:
+            quant = self.quantization
+            options = {key: quant[key] for key in ("group_size", "bits", "mode") if key in quant}
+            options = quant.get(self.decoder.embed, options)
+            table = mx.dequantize(table, parts["scales"], parts.get("biases"), **options)
+        index = {row: i for i, row in enumerate(rows)}
+        return table[mx.array([index[t] for t in flat]).reshape(tokens.shape)]
+
+    def start_first_load(self):
+        """Read resident modules not yet loaded ahead, in run order, so the first pass waits less on disk.
+
+        Only file bytes are read (into the OS page cache), by one thread so reads stay sequential.
+        These modules are planned to stay in RAM, so the read-ahead needs no extra budget.
+        """
+        missing = [name for name in self.names if name in self.resident_names and name not in self.resident]
+        if not (self.prefetching and missing):
+            return
+        self.first_load_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mull-first-load")
+        self.first_load = {name: self.first_load_executor.submit(self.warm_module, name) for name in missing}
+
+    def wait_first_load(self, name):
+        future = self.first_load.pop(name, None)
+        if future is not None and not future.cancelled():
+            try:
+                future.result()
+            except Exception:  # noqa: BLE001  the real load below reads it again and reports errors
+                pass
+
+    def below_minimum_note(self, budget, minimum):
+        gib = 2**30
+        if self.adaptive:
+            fix = (f"keeping {self.keep_free_fraction:.0%} of RAM free for other apps; lower keep_free_fraction "
+                   "(server: --keep-free-percent) or free some memory")
+            setting = "memory_percent=auto"
+        else:
+            fix = "raise memory_percent or free some memory"
+            setting = f"memory_percent={self.memory_percent:g}"
+        return (f"{setting} gives {budget / gib:.2f} GiB, below the {minimum / gib:.2f} GiB needed to keep "
+                f"anything resident: streaming one module at a time (slowest). The model is {fix}.")
 
     def request_budget(self):
         """Free RAM for this request and the share the model may use.
@@ -411,6 +510,10 @@ class AirLLMPackedMlx:
             self.executor.shutdown(wait=True, cancel_futures=True)
             self.executor = None
             self.prefetch_window = None
+        if self.first_load_executor is not None:
+            self.first_load_executor.shutdown(wait=True, cancel_futures=True)
+            self.first_load_executor = None
+            self.first_load = {}
 
     def warm_module(self, name):
         keys = [self.source_keys[k] for k in self.keys[name]]
@@ -464,6 +567,7 @@ class AirLLMPackedMlx:
         if module is None:
             if self.prefetch_window is not None:
                 self.prefetch_window.take(name)
+            self.wait_first_load(name)
             module = self.load_module(name)
             if name in self.resident_names:
                 mx.eval(module.parameters())
@@ -475,7 +579,10 @@ class AirLLMPackedMlx:
 
     def last_logits(self, tokens, cache, *, full_projection=False):
         decoder = self.decoder
-        h = self.run_module(decoder.embed, lambda module: module(tokens))
+        if self.embed_from_rows:
+            h = self.embed_rows(tokens)
+        else:
+            h = self.run_module(decoder.embed, lambda module: module(tokens))
         for name, state in zip(decoder.layers, cache):
             h = self.run_module(name, lambda module: decoder.forward_block(module, h, state))
         if not full_projection:
