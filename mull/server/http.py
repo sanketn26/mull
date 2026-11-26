@@ -33,10 +33,13 @@ class Api:
         self.worker = worker
         self.max_new_tokens_limit = max_new_tokens_limit
         self.web_root = Path(web_root).resolve() if web_root else None
+        self.pipelines = None  # set by --pipelines; None leaves every /pipelines route as 404
 
     def health(self):
         memory = psutil.virtual_memory()
         info = getattr(self.worker.runner, "describe", dict)()
+        if self.pipelines is not None:
+            info = dict(info, pipelines=True)
         return dict(info, status="ok", jobs=self.store.counts(), running_job=self.worker.current,
                     running_jobs=getattr(self.worker, "running", []), max_batch=self.worker.batch.max_batch,
                     free_ram_gb=round(memory.available / 2**30, 2), total_ram_gb=round(memory.total / 2**30, 2))
@@ -169,6 +172,8 @@ def get_route(api, handler, path, query):
     if (match := _ACTION.match(path)) and match.group(2) == "events":
         stream_events(api, handler, int(match.group(1)))
         return None
+    if api.pipelines is not None and path.startswith("/pipelines/"):
+        return api.pipelines.get(path, query, handler)
     target = api.static_file(path)
     if target is None:
         raise ApiError(HTTPStatus.NOT_FOUND, "not found")
@@ -181,12 +186,16 @@ def post_route(api, handler, path, query):
         return api.submit(read_body(handler))
     if (match := _ACTION.match(path)) and match.group(2) == "cancel":
         return api.cancel(int(match.group(1)))
+    if api.pipelines is not None and path.startswith("/pipelines/"):
+        return api.pipelines.post(path, read_body(handler))
     raise ApiError(HTTPStatus.NOT_FOUND, "not found")
 
 
 def delete_route(api, handler, path, query):
     if match := _JOB.match(path):
         return api.delete(int(match.group(1)))
+    if api.pipelines is not None and path.startswith("/pipelines/"):
+        return api.pipelines.delete(path)
     raise ApiError(HTTPStatus.NOT_FOUND, "not found")
 
 
@@ -219,7 +228,13 @@ def send_bytes(handler, status, data, content_type):
 
 def stream_events(api, handler, job_id):
     """Server-sent events: send the job whenever it changes, then end once it has finished."""
-    job = api.job(job_id)
+    first = api.job(job_id)
+    stream_updates(handler, "job", first, lambda: api.store.get(job_id),
+                   lambda job: job["state"] in FINISHED, api.worker.stopping)
+
+
+def stream_updates(handler, event, item, fetch, finished, stopping):
+    """Send `item` whenever its `updated` stamp changes; stop once finished(item), or on shutdown."""
     handler.send_response(HTTPStatus.OK)
     handler.send_header("Content-Type", "text/event-stream")
     handler.send_header("Cache-Control", "no-store")
@@ -228,20 +243,23 @@ def stream_events(api, handler, job_id):
     handler.close_connection = True
     last = None
     try:
-        while job is not None:
-            if job["updated"] != last:
-                last = job["updated"]
-                handler.wfile.write(f"event: job\ndata: {json.dumps(job)}\n\n".encode())
+        while item is not None:
+            if item["updated"] != last:
+                last = item["updated"]
+                handler.wfile.write(f"event: {event}\ndata: {json.dumps(item)}\n\n".encode())
                 handler.wfile.flush()
-            if job["state"] in FINISHED or api.worker.stopping.is_set():
+            if finished(item) or stopping.is_set():
                 break
             time.sleep(EVENT_POLL_SECONDS)
-            job = api.store.get(job_id)
+            item = fetch()
     except (BrokenPipeError, ConnectionResetError):
         pass
 
 
-def make_server(store, worker, host="127.0.0.1", port=8765, max_new_tokens_limit=4096, web_root=None):
-    server = ThreadingHTTPServer((host, port), make_handler(Api(store, worker, max_new_tokens_limit, web_root)))
+def make_server(store, worker, host="127.0.0.1", port=8765, max_new_tokens_limit=4096, web_root=None,
+                pipelines=None):
+    api = Api(store, worker, max_new_tokens_limit, web_root)
+    api.pipelines = pipelines
+    server = ThreadingHTTPServer((host, port), make_handler(api))
     server.daemon_threads = True
     return server

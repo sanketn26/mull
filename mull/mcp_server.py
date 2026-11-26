@@ -69,6 +69,36 @@ class MullClient:
     def jobs(self, limit=20):
         return [summary(job) for job in self.call("/jobs")[:limit]]
 
+    def pipelines_enabled(self):
+        """True when the server was started with --pipelines (or MULL_PIPELINES=1 forces the tools on)."""
+        if os.environ.get("MULL_PIPELINES") == "1":
+            return True
+        try:
+            return bool(self.call("/health").get("pipelines"))
+        except MullError:
+            return False
+
+    def check(self, definition):
+        return self.call("/pipelines/check", {"definition": definition})
+
+    def dry_run(self, definition, params=None):
+        return self.call("/pipelines/dry-run", {"definition": definition, "params": params})["steps"]
+
+    def execute(self, definition, params=None):
+        return self.call("/pipelines/executions", {"definition": definition, "params": params})["id"]
+
+    def execution(self, execution_id, wait_seconds=0):
+        """Return the execution; with wait_seconds, poll until it finishes or the wait runs out."""
+        deadline = time.monotonic() + min(max(wait_seconds, 0), MAX_WAIT_SECONDS)
+        while True:
+            item = self.call(f"/pipelines/executions/{int(execution_id)}")
+            if item["state"] in FINISHED or time.monotonic() >= deadline:
+                return item
+            time.sleep(1)
+
+    def cancel_execution(self, execution_id):
+        return self.call(f"/pipelines/executions/{int(execution_id)}/cancel", {})["cancelled"]
+
 
 def _error_text(error):
     try:
@@ -108,6 +138,22 @@ def result(job):
     return shown
 
 
+OUTPUT_CHARS = 4000
+
+
+def execution_result(item):
+    """What the agent sees of an execution: state and each step's result, long outputs cut."""
+    steps = []
+    for number, step in enumerate(item["steps"], start=1):
+        shown = {"step": number, "kind": step["kind"], "state": step["state"], "output": step["output"][:OUTPUT_CHARS]}
+        if len(step["output"]) > OUTPUT_CHARS:
+            shown["output_truncated"] = True
+        if step["error"]:
+            shown["error"] = step["error"]
+        steps.append(shown)
+    return {"id": item["id"], "name": item["name"], "state": item["state"], "error": item["error"], "steps": steps}
+
+
 INSTRUCTIONS = """Mull runs a local language model in the background, slowly (a few tokens per second when
 the model is larger than free RAM). Use it for work that can wait or must stay on this machine:
 summarising many files, overnight reviews, private documents. Submit with mull_submit, then check
@@ -144,7 +190,43 @@ def build_server(client=None):
         """List recent jobs, newest first, with their state."""
         return client.jobs(limit)
 
+    if client.pipelines_enabled():
+        add_pipeline_tools(server, client)
     return server
+
+
+def add_pipeline_tools(server, client):
+    """Tools for job definitions. Registered only when the Mull server runs with --pipelines."""
+
+    @server.tool()
+    def mull_steps() -> dict:
+        """List the step types a definition may use, with their required and optional arguments."""
+        return client.call("/pipelines/steps")
+
+    @server.tool()
+    def mull_check(definition: dict) -> dict:
+        """Check a job definition without running it. Returns ok, issues and its parameters."""
+        return client.check(definition)
+
+    @server.tool()
+    def mull_dry_run(definition: dict, params: dict | None = None) -> dict:
+        """List what the definition would read, write and ask the model, and do none of it."""
+        return {"steps": client.dry_run(definition, params)}
+
+    @server.tool()
+    def mull_execute(definition: dict, params: dict | None = None) -> dict:
+        """Start a job definition in the background and return its execution id."""
+        return {"id": client.execute(definition, params)}
+
+    @server.tool()
+    async def mull_execution(execution_id: int, wait_seconds: int = 0) -> dict:
+        """Get an execution's state and each step's result. wait_seconds (up to 60) waits for it to finish."""
+        return execution_result(await asyncio.to_thread(client.execution, execution_id, wait_seconds))
+
+    @server.tool()
+    def mull_cancel_execution(execution_id: int) -> dict:
+        """Cancel a queued or running execution."""
+        return {"cancelled": client.cancel_execution(execution_id)}
 
 
 def main():

@@ -7,7 +7,7 @@ import threading
 import unittest
 from pathlib import Path
 
-from mull.mcp_server import MullClient, MullError, build_server, with_files
+from mull.mcp_server import MullClient, MullError, build_server, execution_result, with_files
 from mull.server.http import make_server
 from mull.server.store import JobStore
 from mull.server.worker import Worker
@@ -89,6 +89,67 @@ class TestMcpTools(LiveServer):
         with self.assertRaisesRegex(ToolError, "404: job 999 not found") as caught:
             asyncio.run(self.mcp.call_tool("mull_result", {"job_id": 999}))
         self.assertNotIsInstance(caught.exception, UnexpectedToolError)
+
+
+class TestMcpPipelineTools(unittest.TestCase):
+    """The definition tools exist only when the server runs with --pipelines."""
+
+    def setUp(self):
+        try:
+            import mcp  # noqa: F401
+        except ImportError:
+            self.skipTest("mcp extra not installed")
+        from mull.pipelines.api import PipelineApi
+        from mull.pipelines.runner import Executor
+        from mull.pipelines.spec import Policy
+        from mull.pipelines.store import ExecutionStore
+
+        self.root = tempfile.mkdtemp()
+        self.store = JobStore(":memory:")
+        self.worker = Worker(self.store, FakeRunner(), poll_seconds=0.01)
+        self.worker.start()
+        executions = ExecutionStore(self.store)
+        policy = Policy(roots=(self.root,))
+        self.executor = Executor(executions, self.worker, policy, poll_seconds=0.01)
+        self.executor.start()
+        self.plain = make_server(self.store, self.worker, port=0)
+        self.piped = make_server(self.store, self.worker, port=0, pipelines=PipelineApi(policy, executions, self.executor))
+        for server in (self.plain, self.piped):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        for server in (self.plain, self.piped):
+            server.shutdown()
+            server.server_close()
+        self.executor.stop()
+        self.worker.stop()
+
+    def tools(self, server):
+        client = MullClient(f"http://127.0.0.1:{server.server_port}")
+        return {tool.name for tool in asyncio.run(build_server(client).list_tools())}
+
+    def test_tools_appear_only_with_the_feature(self):
+        self.assertEqual(self.tools(self.plain), {"mull_submit", "mull_result", "mull_cancel", "mull_list"})
+        extra = self.tools(self.piped) - self.tools(self.plain)
+        self.assertEqual(extra, {"mull_steps", "mull_check", "mull_dry_run", "mull_execute", "mull_execution",
+                                 "mull_cancel_execution"})
+
+    def test_execute_and_read_the_result_through_the_client(self):
+        client = MullClient(f"http://127.0.0.1:{self.piped.server_port}")
+        (Path(self.root) / "a.md").write_text("abcdef")
+        definition = {"job": "j", "reads": [self.root], "limits": {"time": "1m"},
+                      "steps": [{"read": {"path": f"{self.root}/a.md"}}, {"prompt": {"text": "{steps.1}", "max_new_tokens": 3}}]}
+        self.assertTrue(client.check(definition)["ok"])
+        self.assertEqual(len(client.dry_run(definition)), 2)
+        item = client.execution(client.execute(definition), wait_seconds=10)
+        shown = execution_result(item)
+        self.assertEqual((shown["state"], shown["steps"][1]["output"]), ("done", "abc"))
+
+    def test_long_outputs_are_cut_for_the_agent(self):
+        item = {"id": 1, "name": "j", "state": "done", "error": None,
+                "steps": [{"kind": "read", "state": "done", "output": "x" * 5000, "error": None}]}
+        shown = execution_result(item)["steps"][0]
+        self.assertEqual((len(shown["output"]), shown["output_truncated"]), (4000, True))
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 #
 #   make setup   install Python, the package (editable) and dev tools with uv (creates .venv)
 #   make run     generate tokens (MODEL=, PROMPT=, MAX_NEW_TOKENS=, COMPRESSION=4bit|8bit, MEMORY_PERCENT=)
-#   make serve   start the job server (MODEL= a packed MLX checkpoint, PORT=8765, WEB=1 for the web interface)
+#   make serve   start the job server (MODEL= a packed MLX checkpoint, PORT=8765, WEB=1 for the web interface, PIPELINE_ROOTS="~/notes ~/Briefs" for job definitions)
 #   make test    run the unit tests that work offline on this machine
 #   make lint    static checks (ruff)
 #   make clean   remove build and cache artifacts (add `make clean-all` to drop .venv too)
@@ -54,7 +54,8 @@ serve:
 	$(UV) run $(EXTRAS) python -m mull.server --model "$(MODEL)" --port $(PORT) \
 		$(if $(MEMORY_PERCENT),--memory-percent $(MEMORY_PERCENT)) $(if $(WEB),--web) \
 		$(if $(KEEP_FREE),--keep-free-percent $(KEEP_FREE)) \
-		$(if $(MAX_BATCH),--max-batch $(MAX_BATCH)) $(if $(UNLOAD_AFTER),--unload-after-seconds $(UNLOAD_AFTER))
+		$(if $(MAX_BATCH),--max-batch $(MAX_BATCH)) $(if $(UNLOAD_AFTER),--unload-after-seconds $(UNLOAD_AFTER)) \
+		$(if $(PIPELINE_ROOTS),--pipelines --pipeline-roots $(PIPELINE_ROOTS))
 
 test:
 	$(UV) run $(EXTRAS) pytest tests -q $(PYTEST_ARGS)

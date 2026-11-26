@@ -42,6 +42,10 @@ def parse_args():
                         help="RAM for reusing prompts that start the same way (packed models; 0 turns it off)")
     parser.add_argument("--web", nargs="?", const=DEFAULT_WEB, type=Path, metavar="DIR",
                         help=f"also serve the web interface (default folder: {DEFAULT_WEB})")
+    parser.add_argument("--pipelines", action="store_true",
+                        help="turn on job definitions and executions (off by default)")
+    parser.add_argument("--pipeline-roots", nargs="+", default=[], metavar="DIR",
+                        help="with --pipelines: the only folders definitions may read or write (default: none)")
     args = parser.parse_args()
     if args.max_batch < 1:
         parser.error("--max-batch must be at least 1")
@@ -49,6 +53,8 @@ def parse_args():
         parser.error("--keep-free-percent must be from 0 to below 100")
     if args.keep_free_percent != 30 and args.memory_percent != "auto":
         parser.error("--keep-free-percent only applies with --memory-percent auto")
+    if args.pipeline_roots and not args.pipelines:
+        parser.error("--pipeline-roots needs --pipelines")
     if args.web and not (args.web / "index.html").is_file():
         parser.error(f"--web: no index.html in {args.web}")
     return args
@@ -57,6 +63,25 @@ def parse_args():
 def _raise_interrupt(signum, frame):
     """Treat SIGTERM like Ctrl-C so `kill` stops the server cleanly and running jobs are kept."""
     raise KeyboardInterrupt
+
+
+def start_pipelines(args, store, worker):
+    """Job definitions are imported and started only when asked for with --pipelines."""
+    if not args.pipelines:
+        return None, None
+    from ..pipelines.api import PipelineApi
+    from ..pipelines.runner import Executor
+    from ..pipelines.spec import Policy
+    from ..pipelines.store import ExecutionStore
+
+    roots = tuple(str(Path(root).expanduser()) for root in args.pipeline_roots)
+    if not roots:
+        print("Pipelines on, but no --pipeline-roots: definitions cannot read or write files.", flush=True)
+    policy = Policy(roots=roots, max_new_tokens=args.max_new_tokens_limit)
+    executions = ExecutionStore(store)
+    executor = Executor(executions, worker, policy)
+    executor.start()
+    return PipelineApi(policy, executions, executor), executor
 
 
 def main():
@@ -77,7 +102,8 @@ def main():
     unload_after = args.unload_after_seconds if args.unload_after_seconds >= 0 else None
     worker = Worker(store, runner, max_batch=args.max_batch, unload_after=unload_after)
     worker.start()
-    server = make_server(store, worker, args.host, args.port, args.max_new_tokens_limit, args.web)
+    pipelines, executor = start_pipelines(args, store, worker)
+    server = make_server(store, worker, args.host, args.port, args.max_new_tokens_limit, args.web, pipelines)
     where = f"http://{args.host}:{server.server_port}/"
     print(f"Mull job server: API at {where}jobs, web interface {'at ' + where if args.web else 'off (--web)'}; "
           f"jobs in {args.db}", flush=True)
@@ -88,6 +114,8 @@ def main():
         pass
     finally:
         server.server_close()
+        if executor:
+            executor.stop()
         worker.stop()
 
 

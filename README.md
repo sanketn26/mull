@@ -151,6 +151,45 @@ Batched answers are valid but not always identical to running each job alone. Ba
 
 Jobs run one at a time, in order. The server uses `memory_percent="auto"` unless you pass `--memory-percent` (or `MEMORY_PERCENT=`). A job that needs more memory than is free fails with a message instead of pushing the machine into swap. The server listens on localhost only and has no authentication. The web interface in `web/` is plain HTML, CSS and JavaScript that uses only the API above; it is served only with `--web` (or `WEB=1`).
 
+### Job definitions (optional, off by default)
+
+Start the server with `--pipelines` and name the folders definitions may use:
+
+```
+make serve MODEL=... PIPELINE_ROOTS="~/notes ~/Briefs"
+# or: python -m mull.server --model ... --pipelines --pipeline-roots ~/notes ~/Briefs
+```
+
+Without `--pipelines` nothing changes: no extra routes or tables, and the code is never imported. With it but no `--pipeline-roots`, definitions cannot touch any file. Definitions are JSON, or YAML with `pip install 'mull[jobs]'`.
+
+```yaml
+job: weekly-notes
+params:
+  topic: {type: text, label: Topic, default: speculative decoding}
+reads: [~/notes]
+writes: [~/Briefs]
+limits: {time: 30m}
+steps:
+  - read:   {path: ~/notes/week.md}
+  - prompt: {text: "Summarise, focusing on {params.topic}: {steps.1}", max_new_tokens: 300}
+  - save:   {path: "~/Briefs/{date}.md", content: "{steps.2}"}
+```
+
+Steps come from a fixed list (`read`, `prompt`, `save`). A step may only touch folders listed under `reads` and `writes`, and those must lie inside `--pipeline-roots`. Paths are resolved (symlinks, `..`) and checked again at the moment each step runs. The server caps time, steps and tokens whatever a definition asks for. Each `prompt` step is an ordinary job in the queue, so batching and `/jobs/{id}` still apply.
+
+```
+POST   /pipelines/check                {"definition": ...}                -> {"ok", "issues", "params"}
+POST   /pipelines/dry-run              {"definition": ..., "params": {}}  -> {"steps": [...]}
+GET    /pipelines/steps                                                   -> the step list
+POST   /pipelines/executions           {"definition": ..., "params": {}}  -> {"id"}
+GET    /pipelines/executions[/{id}]    state and each step's output
+GET    /pipelines/executions/{id}/events    live updates (server-sent events)
+POST   /pipelines/executions/{id}/cancel
+DELETE /pipelines/executions/{id}      finished only
+```
+
+`mull-mcp` adds matching tools (`mull_check`, `mull_dry_run`, `mull_execute`, `mull_execution`, `mull_steps`, `mull_cancel_execution`) when the server reports `pipelines` in `/health`, so Claude Code, Codex or Gemini CLI can write, check and run definitions. Set `MULL_PIPELINES=1` to register them before the server is up.
+
 ### Use from Claude Code or Codex (MCP)
 
 `mull-mcp` is an MCP server that lets a coding agent hand slow or private work to Mull: summarising many files, overnight reviews, transcripts. The agent queues a job and checks back later; it can pass file paths, so large files don't go through its own context. Tools: `mull_submit`, `mull_result` (can wait up to 60 s), `mull_cancel`, `mull_list`.

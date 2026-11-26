@@ -30,6 +30,7 @@ mac = [
 ]
 cuda = ["bitsandbytes"]            # 4/8-bit compression on CUDA
 mcp = ["mcp>=2.3,<3; python_version >= '3.10'"]  # mull-mcp: lets Claude Code / Codex queue jobs
+jobs = ["pyyaml"]                  # optional: write job definitions in YAML (JSON works without it)
 kimi = ["compressed-tensors"]      # only for checkpoints stored in that format (Kimi K3)
 
 [project.scripts]
