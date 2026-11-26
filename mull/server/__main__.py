@@ -36,6 +36,8 @@ def parse_args():
                         help="with --memory-percent auto: share of total RAM always left for other apps (default 30)")
     parser.add_argument("--max-batch", type=int, default=4,
                         help="jobs decoded together on packed models (each step reads the weights once for all)")
+    parser.add_argument("--unload-after-seconds", type=float, default=120,
+                        help="free the model's RAM after this long without a job (0: at once; negative: never)")
     parser.add_argument("--prefix-cache-gb", type=float, default=1.0,
                         help="RAM for reusing prompts that start the same way (packed models; 0 turns it off)")
     parser.add_argument("--web", nargs="?", const=DEFAULT_WEB, type=Path, metavar="DIR",
@@ -72,7 +74,8 @@ def main():
         raise SystemExit("The job server runs MLX models on macOS: packed checkpoints (Qwen3, Qwen3.5, gpt-oss, "
                          "Qwen3 MoE) and Llama/Mistral checkpoints.")
     store = JobStore(args.db, max_queued=args.max_queued)
-    worker = Worker(store, runner, max_batch=args.max_batch)
+    unload_after = args.unload_after_seconds if args.unload_after_seconds >= 0 else None
+    worker = Worker(store, runner, max_batch=args.max_batch, unload_after=unload_after)
     worker.start()
     server = make_server(store, worker, args.host, args.port, args.max_new_tokens_limit, args.web)
     where = f"http://{args.host}:{server.server_port}/"

@@ -54,7 +54,7 @@ serve:
 	$(UV) run $(EXTRAS) python -m mull.server --model "$(MODEL)" --port $(PORT) \
 		$(if $(MEMORY_PERCENT),--memory-percent $(MEMORY_PERCENT)) $(if $(WEB),--web) \
 		$(if $(KEEP_FREE),--keep-free-percent $(KEEP_FREE)) \
-		$(if $(MAX_BATCH),--max-batch $(MAX_BATCH))
+		$(if $(MAX_BATCH),--max-batch $(MAX_BATCH)) $(if $(UNLOAD_AFTER),--unload-after-seconds $(UNLOAD_AFTER))
 
 test:
 	$(UV) run $(EXTRAS) pytest tests -q $(PYTEST_ARGS)

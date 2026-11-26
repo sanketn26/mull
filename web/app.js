@@ -27,7 +27,8 @@ async function refreshHealth() {
     const h = await api("/health");
     const ids = h.running_jobs || (h.running_job ? [h.running_job] : []);
     const running = ids.length ? `running ${ids.map((id) => `#${id}`).join(", ")} (batch up to ${h.max_batch})` : "idle";
-    box.textContent = `${h.model || "model"} · ${running} · ${h.jobs.queued} queued · ` +
+    const state = ids.length || h.loaded !== false ? running : "not loaded";
+    box.textContent = `${h.model || "model"} · ${state} · ${h.jobs.queued} queued · ` +
       `${h.free_ram_gb} of ${h.total_ram_gb} GB RAM free`;
     box.classList.remove("down");
   } catch (error) {

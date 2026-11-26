@@ -26,10 +26,27 @@ class PackedModelRunner:
     def decode(self, ids):
         return self.tokenizer.decode(ids)
 
+    @property
+    def loaded(self):
+        """Whether anything is held in RAM: resident weights, the prefix cache or MLX's buffer cache."""
+        import mlx.core as mx
+
+        held = self.prefix_cache.nbytes if self.prefix_cache is not None else 0
+        return bool(self.model.resident) or held > 0 or mx.get_cache_memory() > 0
+
+    def unload(self):
+        """Free the weights and the prefix cache; the next job reloads what it needs."""
+        if self.prefix_cache is not None:
+            self.prefix_cache.clear()
+        self.model.release_weights()
+
     def describe(self):
+        import mlx.core as mx
+
         model = self.model
         share = "auto" if getattr(model, "adaptive", False) else getattr(model, "memory_percent", None)
-        info = {"model": self.name, "memory_percent": share}
+        info = {"model": self.name, "memory_percent": share, "loaded": self.loaded,
+                "model_memory_gb": round(mx.get_active_memory() / 2**30, 2)}
         if share == "auto":
             info["keep_free_percent"] = round(model.keep_free_fraction * 100, 1)
         if self.prefix_cache is not None:
@@ -87,6 +104,15 @@ class LlamaMlxRunner(PackedModelRunner):
     def __init__(self, model, name=None):
         super().__init__(model, name)
         self.lock = threading.Lock()
+
+    @property
+    def loaded(self):
+        import mlx.core as mx
+
+        return bool(self.model._resident) or mx.get_cache_memory() > 0
+
+    def unload(self):
+        self.model.release_weights()
 
     def make_batch(self, max_batch):
         return SequentialBatch(self)

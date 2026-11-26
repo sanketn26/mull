@@ -499,3 +499,46 @@ def test_embedding_rows_reject_out_of_range_ids(tmp_path):
     key = model.source_keys[model.decoder.embed + ".weight"]
     with pytest.raises(IndexError):
         load_row_matrix(model.path, model.source_manifest, key, [0, vocabulary])
+
+
+def load_growth_mb(model, loads=400):
+    """Private memory the process gains over many streamed module loads."""
+    import gc
+
+    import psutil
+
+    name = model.decoder.layers[0]
+
+    def once():
+        module = model.load_module(name)
+        mx.eval(module.parameters())
+
+    for _ in range(20):
+        once()
+    gc.collect()
+    mx.clear_cache()
+    before = psutil.Process().memory_full_info().uss
+    for _ in range(loads):
+        once()
+    gc.collect()
+    mx.clear_cache()
+    return (psutil.Process().memory_full_info().uss - before) / 2**20
+
+
+def test_streaming_loads_do_not_leak_memory(tmp_path):
+    # Every module built and thrown away used to leave a node on MLX's global random-key graph:
+    # over 30 KB per layer, about a megabyte per streamed token on Qwen3-8B.
+    path = tmp_path / "qwen3"
+    qwen3_fixture(path, tied=False, seed=3)
+    model = AutoModel.from_pretrained(path, memory_percent=0)
+    assert load_growth_mb(model) < 1.0
+
+
+def test_leak_test_would_catch_the_old_behaviour(tmp_path, monkeypatch):
+    import mull.airllm_packed_mlx as runtime
+
+    path = tmp_path / "qwen3"
+    qwen3_fixture(path, tied=False, seed=3)
+    model = AutoModel.from_pretrained(path, memory_percent=0)
+    monkeypatch.setattr(runtime, "settle_random_state", lambda: None)
+    assert load_growth_mb(model) > 2.0

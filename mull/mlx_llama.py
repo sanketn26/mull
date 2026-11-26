@@ -181,6 +181,17 @@ class TransformerBlock(nn.Module):
         out = h + r
         return out, cache
 
+def settle_random_state():
+    """Evaluate MLX's global random key.
+
+    Building a module draws random initial weights from that key, and a module that is built, filled
+    from disk and thrown away never evaluates them, so each build leaves a node on a graph that grows
+    for the life of the process: about 1 KB per Linear, over 30 KB per layer, a megabyte per streamed
+    token. Evaluating the key after each build cuts that graph off (measured: 2.4 KB per Linear, then 0.0).
+    """
+    mx.eval(mx.random.state)
+
+
 def sample(logits, temperature=0):
     if temperature == 0:
         return mx.argmax(logits, axis=-1)

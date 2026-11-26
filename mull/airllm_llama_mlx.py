@@ -12,7 +12,7 @@ from .checkpoint import find_or_create_local_splitted_path
 from .memory import AUTO_KEEP_FREE, auto_memory_budget, collect_garbage
 from .mlx_llama import (  # noqa: F401  (ModelArgs, Attention, ... re-exported for existing imports)
     Attention, FeedForward, ModelArgs, RMSNorm, TransformerBlock, _coerce_to_mlx_array,
-    get_model_args_from_config, sample, sanitize_config,
+    get_model_args_from_config, sample, sanitize_config, settle_random_state,
 )
 from .persist.mlx_model_persister import QUANT_BITS, QUANT_GROUP_SIZE, MlxModelPersister
 from .prefetch import PrefetchWindow
@@ -207,6 +207,7 @@ class AirLLMLlamaMlx:
             weights = self._load_weights(self.prefetch_window.take(name))
             selected = select(weights)
             module = self._quantize_to_match(build(), selected)
+            settle_random_state()
             module.update(selected)
             del weights, selected
             if name in self._resident_names:
@@ -240,7 +241,17 @@ class AirLLMLlamaMlx:
                     break
         return self.tokenizer.decode(tokens)
 
+    def release_weights(self):
+        """Drop every loaded layer. The next generation plans residency again from the RAM free then."""
+        self._resident.clear()
+        self._replan = True
+        collect_garbage()
+        mx.clear_cache()
+
     def model_generate(self, x, temperature=0, max_new_tokens=None):
+        if getattr(self, '_replan', False):
+            self._replan = False
+            self._init_streaming(self.prefetching)
         a = self.model_args
         names = self.layer_names_dict
         cache = [None] * a.n_layers

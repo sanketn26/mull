@@ -1,5 +1,6 @@
 """Block streaming for native packed MLX-LM text checkpoints."""
 
+import gc
 import json
 import math
 from concurrent.futures import ThreadPoolExecutor
@@ -17,7 +18,7 @@ from mlx_lm.utils import load_tokenizer
 
 from .checkpoint import safetensor_manifest
 from .mlx_experts import ExpertCache, StreamedExperts
-from .mlx_llama import _coerce_to_mlx_array, sample
+from .mlx_llama import _coerce_to_mlx_array, sample, settle_random_state
 from .persist.mlx_model_persister import load_packed_weights, load_row_matrix, warm_packed_weights
 from .memory import AUTO_KEEP_FREE, auto_memory_budget
 from .prefetch import PrefetchWindow
@@ -526,6 +527,20 @@ class AirLLMPackedMlx:
             return available, int(available * self.memory_percent / 100)
         return available, auto_memory_budget(available, self.keep_free_fraction)
 
+    def release_weights(self):
+        """Drop every weight and cache held in RAM. The next request plans again and reloads what it needs."""
+        with self.request_lock:
+            self.finish_request()
+            self.resident.clear()
+            self.resident_names = set()
+            self.plan = None
+            if self.experts is not None:
+                self.experts.cache.clear()
+                self.experts.cache_bytes = 0
+                self.experts.routers.clear()
+            gc.collect()
+            mx.clear_cache()
+
     def finish_request(self):
         if self.executor is not None:
             self.executor.shutdown(wait=True, cancel_futures=True)
@@ -549,12 +564,15 @@ class AirLLMPackedMlx:
         quant = self.quantization
         options = {key: quant[key] for key in ("group_size", "bits", "mode") if key in quant}
         if "scales" in weights:
-            return module.to_quantized(**quant.get(prefix.rstrip("."), options))
+            quantized = module.to_quantized(**quant.get(prefix.rstrip("."), options))
+            settle_random_state()
+            return quantized
 
         def predicate(path, child):
             return quant.get(prefix + path, hasattr(child, "to_quantized") and f"{path}.scales" in weights)
 
         nn.quantize(module, **options, class_predicate=predicate)
+        settle_random_state()
         return module
 
     def load_module(self, name):

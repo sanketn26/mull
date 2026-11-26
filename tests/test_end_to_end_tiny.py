@@ -120,6 +120,18 @@ class TestMlxRuntime(_TinyModelCase):
         _, resident = self._generate(test_nonlayered=True)
         self.assertEqual(streamed, resident)
 
+    def test_release_frees_layers_and_generation_still_matches(self):
+        import mlx.core as mx
+        model, first = self._generate(memory_percent=50)
+        self.assertTrue(model._resident)
+        model.release_weights()
+        self.assertFalse(model._resident)
+        self.assertEqual(mx.get_cache_memory(), 0)
+        model.tokenizer.eos_token_id = None
+        again = model.generate(mx.array(self.ids.numpy()), max_new_tokens=NEW_TOKENS)
+        self.assertEqual(again, first)
+        self.assertTrue(model._resident)                   # planned again and reloaded
+
     def test_8bit_runs_streamed_and_resident_alike(self):
         _, streamed = self._generate(memory_percent=0, compression="8bit")
         _, resident = self._generate(memory_percent=50, compression="8bit")

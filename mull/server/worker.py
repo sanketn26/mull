@@ -1,6 +1,7 @@
 """The worker that owns the model: admits queued jobs into a batch and steps them together."""
 
 import threading
+import time
 import traceback
 
 from .batch import NoRoom, SequentialBatch
@@ -43,8 +44,11 @@ class Active:
 class Worker:
     """Takes jobs from the store, runs them in a batch and writes output as it is produced."""
 
-    def __init__(self, store, runner, poll_seconds=0.5, max_batch=1):
+    def __init__(self, store, runner, poll_seconds=0.5, max_batch=1, unload_after=None, clock=time.monotonic):
         self.store = store
+        self.unload_after = unload_after  # idle seconds before the model is freed (None: keep it loaded)
+        self.clock = clock
+        self.idle_since = None
         self.runner = runner
         self.poll_seconds = poll_seconds
         self.batch = runner.make_batch(max_batch) if hasattr(runner, "make_batch") else SequentialBatch(runner)
@@ -76,6 +80,7 @@ class Worker:
     def loop(self):
         while not self.stopping.is_set():
             if not self.tick():
+                self.maybe_unload()
                 self.wake.wait(self.poll_seconds)
                 self.wake.clear()
         self.active.clear()  # left running in the store: the next start queues them again
@@ -86,6 +91,26 @@ class Worker:
         if not self.active:
             return False
         self.advance()
+        return True
+
+    def maybe_unload(self):
+        """Free the model once nothing has run for ``unload_after`` seconds. True if it was freed."""
+        if self.active or not getattr(self.runner, "loaded", False):
+            self.idle_since = None
+            return False
+        if self.unload_after is None:
+            return False
+        now = self.clock()
+        if self.idle_since is None:
+            self.idle_since = now
+        if now - self.idle_since < self.unload_after:
+            return False
+        try:
+            self.runner.unload()
+        except Exception:  # noqa: BLE001  keep serving; the next job loads again
+            traceback.print_exc()
+            return False
+        self.idle_since = None
         return True
 
     def run_one(self):

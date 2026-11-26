@@ -130,3 +130,60 @@ def test_short_job_beside_long_one_is_budgeted_at_padded_length(model):
     assert model.batch_rows == 2
     batch.remove([0, 1])
     assert model.batch_rows == 1
+
+
+def test_worker_frees_the_model_after_the_idle_time(model):
+    import mlx.core as mx
+
+    now = [0.0]
+    store = JobStore(":memory:")
+    runner = TokenRunner(model, prefix_cache=PrefixCache())
+    worker = Worker(store, runner, max_batch=2, unload_after=60, clock=lambda: now[0])
+    store.submit("5 9 14 3", 4)
+    worker.run_one()
+    assert runner.loaded and model.resident
+    assert not worker.maybe_unload()                   # idle clock starts here
+    now[0] = 59
+    assert not worker.maybe_unload() and runner.loaded  # not long enough
+    now[0] = 61
+    assert worker.maybe_unload()
+    assert not model.resident and runner.prefix_cache.nbytes == 0 and not runner.loaded
+    assert mx.get_cache_memory() == 0
+    store.submit("5 9 14 3", 4)                         # the next job loads again and matches
+    worker.run_one()
+    assert store.get(2)["state"] == "done" and store.get(2)["output"] == store.get(1)["output"]
+
+
+def test_worker_never_frees_while_running_or_when_disabled(model):
+    now = [0.0]
+    store = JobStore(":memory:")
+    runner = TokenRunner(model)
+    keep = Worker(store, runner, unload_after=None, clock=lambda: now[0])
+    store.submit("5 9 14 3", 4)
+    keep.run_one()
+    now[0] = 10_000
+    assert not keep.maybe_unload() and model.resident   # unload_after=None keeps it loaded
+    busy = Worker(store, runner, max_batch=1, unload_after=0, clock=lambda: now[0])
+    store.submit("5 9 14 3", 40)
+    busy.tick()
+    assert busy.active and not busy.maybe_unload() and model.resident   # a job is running
+
+
+def test_repeated_load_and_unload_does_not_grow_memory(model):
+    import gc
+
+    import mlx.core as mx
+
+    runner = TokenRunner(model, prefix_cache=PrefixCache())
+    store = JobStore(":memory:")
+    worker = Worker(store, runner, unload_after=0)
+    readings = []
+    for _ in range(6):
+        store.submit("5 9 14 3 27 8", 8)
+        worker.run_one()
+        worker.maybe_unload()
+        worker.maybe_unload()
+        gc.collect()
+        readings.append((mx.get_active_memory(), mx.get_cache_memory()))
+    assert all(cache == 0 for _, cache in readings)
+    assert max(active for active, _ in readings[1:]) <= readings[1][0]   # flat after the first cycle
